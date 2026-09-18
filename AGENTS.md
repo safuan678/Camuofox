@@ -230,6 +230,32 @@ Invariants worth not breaking:
   `_has_geoip()` gates the `geoip` flag and clears it with a notice when absent.
   Leaving the flag set makes every L3+ rung fail to launch on a plain install and
   report an error for a posture it never actually tested.
+- **A rung declares only headers the client can actually change.** Firefox generates
+  `Sec-Fetch-*`, `Upgrade-Insecure-Requests`, `Accept-Encoding` and `Referer` itself;
+  measured, a route cannot override or drop them, so declaring one is a no-op whose
+  `adds` claim reads as a control it is not. They are listed in
+  `UNCONTROLLABLE_HEADERS`, and `test_no_rung_declares_a_header_the_client_cannot_change`
+  enforces it. `User-Agent`, `Accept`, `Accept-Language` and `Cache-Control` *are*
+  settable and stay out of that set, so a rung that pins a wrong one is judged by its
+  coherence tests instead of being excused as impossible.
+- **A header pinned on a Firefox engine must be a Firefox value.** Camoufox sends a
+  Firefox UA, so Chromium's `Accept` (with `image/avif,image/webp,image/apng`) or
+  Chromium's `Cache-Control: max-age=0` is a cross-engine mismatch the audit would be
+  *manufacturing* rather than measuring. This is the same bug class the tool exists to
+  detect, and it is what `test_no_rung_pins_an_accept_belonging_to_a_different_engine`
+  guards.
+- **Geography must come from the exit IP, never from the host.** `geoip=True` is
+  resolved at *launch*, but Playwright scopes `proxy` to the *context*, so launching
+  with the flag and no session bakes this host's timezone, locale and WebRTC address
+  into a visitor whose traffic exits a pool. The fix is to pass the visitor's
+  `proxy_session` into the launch: `launch_options` then resolves the exit *through*
+  the proxy. A verified `exit_ip` is passed as `geoip` instead, which skips that
+  second lookup so the launch cannot land on a different exit than the context uses.
+  Do not "fix" this by disabling geoip when the exit is unverified -- that drops the
+  alignment *and* leaves WebRTC pointing at this host, which is worse. A rung that
+  both rotates IPs and sets `geoip` also cannot share one browser:
+  `_launch_needs_own_proxy()` forces a launch per visitor, because the geography is
+  baked in when the browser starts.
 - **The two fallbacks belong to `_launch_options()`, and its tests must not
   launch.** Both are decisions about what a rung launches with, so they live in
   one method that returns the option dict. CI's `pythonlib` tier never fetches a

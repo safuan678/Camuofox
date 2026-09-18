@@ -1,0 +1,435 @@
+"""
+Human interaction primitives for the browser rungs.
+
+The audit's behavioral rung claims to look like a reader. A reader moves a
+pointer, lands on things, scrolls with momentum, and types at an uneven cadence.
+A rung that only issues `mouse.wheel` and `locator.click` has none of that: its
+cursor entropy is zero and every click has a zero-length press, which is exactly
+what click-forensics score.
+
+Two properties are load-bearing here, and both are the difference between this
+and a naive implementation:
+
+* **Distributions, not uniform ranges.** Inter-key delay, hold duration and
+  scroll step are all drawn from right-skewed distributions. Uniform draws are
+  the tell -- real cadence has a mode, a tail, and a longer pause at every word
+  boundary.
+* **The pointer has a history.** A move must start from wherever the pointer
+  actually is, otherwise the first leg of every trajectory is a teleport. That is
+  why the state lives in :class:`Cursor` rather than in free functions.
+
+Nothing in this module imports Playwright. The only Playwright-typed argument is
+the `page`/`locator` handed in at call time, so the engine still imports -- and
+L0 still runs -- with nothing installed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import random
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple
+
+__all__ = [
+    "BehaviorModel",
+    "Cursor",
+    "cursor_path",
+    "keystroke_delays",
+    "reading_pauses",
+    "spend_dwell",
+    "wheel_profile",
+    "viewport_size",
+]
+
+#: Two coordinates. Points stay floats: rounding to integers here would quantise
+#: the trajectory, which is a velocity-domain signal.
+Point = Tuple[float, float]
+
+
+@dataclass
+class BehaviorModel:
+    """
+    Tunables for the interaction distributions.
+
+    Kept as data (not constants scattered through the code) so an operator can
+    tune cadence for a target without editing the engine, and so the shapes can be
+    asserted in tests.
+    """
+
+    # -- cursor ------------------------------------------------------------
+    #: How many legs one move is broken into. A hand corrects mid-flight; a single
+    #: straight interpolation is the shape a script produces.
+    leg_weights: Tuple[float, float, float] = (0.45, 0.40, 0.15)
+    #: Perpendicular scatter at each leg boundary, in pixels.
+    leg_jitter_px: float = 6.0
+    #: Fraction of moves that overshoot the target and settle back.
+    overshoot_probability: float = 0.25
+    #: Largest overshoot distance, in pixels.
+    overshoot_px: float = 9.0
+    #: Pause between legs, in seconds. This is reaction/correction time.
+    leg_pause_s: Tuple[float, float] = (0.008, 0.045)
+    #: Movement burst size: a human issues a few moves, then briefly holds still.
+    samples_per_burst: int = 6
+    #: Hold between bursts, in seconds.
+    burst_pause_s: Tuple[float, float] = (0.03, 0.12)
+
+    # -- click -------------------------------------------------------------
+    #: Press duration (down -> up), in seconds. Well above zero: a zero-length
+    #: press is a machine tell, and browsers emit no dwell for one.
+    hold_median_s: float = 0.09
+    hold_sigma: float = 0.35
+    hold_min_s: float = 0.03
+    hold_max_s: float = 0.25
+    #: Pause after a click lands, before the next action.
+    post_click_s: Tuple[float, float] = (0.05, 0.30)
+
+    # -- scrolling ---------------------------------------------------------
+    #: First wheel delta of a burst, in pixels, before momentum takes over.
+    wheel_base_px: Tuple[float, float] = (110.0, 240.0)
+    #: Per-step momentum decay. A trackpad keeps emitting after the fingers stop.
+    wheel_decay: float = 0.82
+    #: Multiplier range for the initial flick.
+    wheel_flick: Tuple[float, float] = (1.25, 2.0)
+    #: Gap between wheel events inside one momentum burst, in seconds.
+    wheel_step_s: Tuple[float, float] = (0.012, 0.055)
+    #: Reading pause between bursts, in seconds.
+    wheel_burst_pause_s: Tuple[float, float] = (0.35, 1.8)
+    #: Fraction of scroll bursts that go back up, as a reader re-reads a line.
+    wheel_reverse_probability: float = 0.18
+
+    # -- typing ------------------------------------------------------------
+    #: Base inter-key delay, log-normal median in seconds.
+    key_median_s: float = 0.115
+    key_sigma: float = 0.42
+    key_min_s: float = 0.035
+    key_max_s: float = 0.9
+    #: Extra delay after a space, and after punctuation, in seconds.
+    word_boundary_s: Tuple[float, float] = (0.05, 0.22)
+    punctuation_s: Tuple[float, float] = (0.08, 0.35)
+    #: A typo, then a backspace, then the right key.
+    typo_probability: float = 0.06
+
+    # -- dwell -------------------------------------------------------------
+    #: Cap on a single uninterruptible sleep, in seconds. Bounds the tail of the
+    #: log-normal dwell so one unlucky draw cannot hold a slot for minutes; the
+    #: remainder is still spent, just in slices, so cancellation stays responsive.
+    sleep_slice_s: float = 0.25
+
+
+async def viewport_size(page: Any, default: Tuple[int, int] = (1280, 720)) -> Tuple[int, int]:
+    """
+    The viewport a pointer can actually reach.
+
+    Asked of the page rather than read from `page.viewport_size`, because Camoufox
+    launches with `no_viewport` when it spoofs window dimensions -- Playwright then
+    reports `None` for the viewport even though the content area is real. Using
+    `innerWidth`/`innerHeight` keeps coordinate maths in the same space the page
+    uses.
+    """
+    try:
+        size = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+        width = int((size or {}).get("w") or 0)
+        height = int((size or {}).get("h") or 0)
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    return default
+
+
+def cursor_path(start: Point, end: Point, rng: random.Random, model: BehaviorModel) -> List[Point]:
+    """
+    The intermediate points of one hand movement.
+
+    Human aiming is not a straight line: it decomposes into a ballistic leg and
+    one or two corrective legs, each with scatter, and it often overshoots before
+    settling. Interpolating straight from A to B is the single most obvious
+    trajectory tell, so the sub-points matter as much as the destination.
+    """
+    legs = rng.choices((1, 2, 3), weights=model.leg_weights, k=1)[0]
+    points: List[Point] = []
+
+    for leg in range(1, legs):
+        fraction = leg / legs
+        points.append(
+            (
+                start[0] + (end[0] - start[0]) * fraction + rng.gauss(0.0, model.leg_jitter_px),
+                start[1] + (end[1] - start[1]) * fraction + rng.gauss(0.0, model.leg_jitter_px),
+            )
+        )
+
+    if rng.random() < model.overshoot_probability:
+        vx, vy = end[0] - start[0], end[1] - start[1]
+        norm = math.hypot(vx, vy) or 1.0
+        overshoot = rng.uniform(3.0, model.overshoot_px)
+        points.append((end[0] + vx / norm * overshoot, end[1] + vy / norm * overshoot))
+
+    points.append(end)
+    return points
+
+
+def wheel_profile(steps: int, rng: random.Random, model: BehaviorModel) -> List[float]:
+    """
+    Per-event wheel deltas for one scroll burst.
+
+    A real wheel/trackpad burst is a flick followed by momentum decay, not N
+    identical deltas. A constant delta per event is a synthetic-device signature,
+    and one that carries no velocity information at all is worse.
+    """
+    base = rng.uniform(*model.wheel_base_px)
+    deltas: List[float] = []
+    for step in range(max(0, steps)):
+        if step == 0:
+            multiplier = rng.uniform(*model.wheel_flick)
+        else:
+            multiplier = model.wheel_decay**step
+        deltas.append(base * multiplier * rng.uniform(0.7, 1.3))
+    return deltas
+
+
+def reading_pauses(steps: int, rng: random.Random, model: BehaviorModel) -> List[float]:
+    """Reading pause that follows each scroll burst."""
+    return [rng.uniform(*model.wheel_burst_pause_s) for _ in range(max(0, steps))]
+
+
+def keystroke_delays(text: str, rng: random.Random, model: BehaviorModel) -> List[float]:
+    """
+    Inter-key delay per character.
+
+    Draws from a log-normal (most keys fast, a long tail) with an extra pause at
+    word boundaries and punctuation. Uniform delay across a whole string is a
+    keystroke-dynamics give-away.
+    """
+    delays: List[float] = []
+    for char in text:
+        delay = rng.lognormvariate(math.log(max(model.key_median_s, 1e-6)), model.key_sigma)
+        delay = min(max(delay, model.key_min_s), model.key_max_s)
+        if char == " ":
+            delay += rng.uniform(*model.word_boundary_s)
+        elif char in ",.;:!?-'\"":
+            delay += rng.uniform(*model.punctuation_s)
+        delays.append(delay)
+    return delays
+
+
+class Cursor:
+    """
+    A pointer that remembers where it is.
+
+    Owns the page's mouse for the duration of one visit. Every move starts from
+    the tracked position, so the trajectory the page sees is continuous rather
+    than a series of teleports -- which is what the anti-detect engine's humanizer
+    needs to produce a plausible curve, and what a velocity scorer measures.
+    """
+
+    def __init__(self, page: Any, rng: random.Random, model: Optional[BehaviorModel] = None) -> None:
+        self._page = page
+        self._rng = rng
+        self._model = model or BehaviorModel()
+        self._width, self._height = 1280, 720
+        self._sized = False
+        self.x = 0.0
+        self.y = 0.0
+        self._placed = False
+
+    async def _ensure_size(self) -> None:
+        if not self._sized:
+            self._width, self._height = await viewport_size(self._page)
+            self._sized = True
+
+    async def _place(self) -> None:
+        """
+        Put the pointer somewhere plausible before the first move.
+
+        Browsers start the cursor at (0, 0), and a trajectory whose first leg
+        begins in the top-left corner is a machine tell.
+        """
+        if self._placed:
+            return
+        await self._ensure_size()
+        self.x = self._rng.uniform(self._width * 0.25, self._width * 0.75)
+        self.y = self._rng.uniform(self._height * 0.10, self._height * 0.35)
+        self._placed = True
+
+    def _clamp_x(self, x: float) -> float:
+        return min(max(x, 1.0), max(2.0, self._width - 2.0))
+
+    def _clamp_y(self, y: float) -> float:
+        return min(max(y, 1.0), max(2.0, self._height - 2.0))
+
+    def _clamp(self, x: float, y: float) -> Point:
+        return (self._clamp_x(x), self._clamp_y(y))
+
+    async def move_to(self, x: float, y: float, *, min_distance: float = 0.0) -> None:
+        """
+        Move the pointer to (x, y) along a human path.
+
+        `min_distance` skips moves shorter than the given distance, so a caller
+        that targets the same control twice does not emit a burst of
+        zero-length jitter.
+        """
+        await self._place()
+        target = self._clamp(x, y)
+        if min_distance and math.hypot(target[0] - self.x, target[1] - self.y) < min_distance:
+            return
+
+        points = cursor_path((self.x, self.y), target, self._rng, self._model)
+        for index, (px, py) in enumerate(points):
+            cx, cy = self._clamp(px, py)
+            try:
+                await self._page.mouse.move(cx, cy)
+            except Exception:
+                return
+            self.x, self.y = cx, cy
+            if index < len(points) - 1:
+                # Bursts, not one sample per leg: a real hand issues a short run
+                # of moves and then briefly holds.
+                for _ in range(max(0, self._model.samples_per_burst - 1)):
+                    jitter_x = self._clamp_x(self.x + self._rng.gauss(0.0, 1.5))
+                    jitter_y = self._clamp_y(self.y + self._rng.gauss(0.0, 1.5))
+                    try:
+                        await self._page.mouse.move(jitter_x, jitter_y)
+                    except Exception:
+                        return
+                await asyncio.sleep(self._rng.uniform(*self._model.leg_pause_s))
+
+    async def glance(self) -> None:
+        """
+        Move the pointer to a plausible reading position.
+
+        A reader who only scrolls still rests a cursor somewhere on the page: a
+        page whose sole pointer activity is a wheel is a page no mouse ever
+        visited. Emitting one move per page keeps pointer entropy non-zero on
+        visits that never touch a control.
+        """
+        await self._ensure_size()
+        await self.move_to(
+            self._rng.uniform(self._width * 0.15, self._width * 0.85),
+            self._rng.uniform(self._height * 0.15, self._height * 0.80),
+        )
+
+    async def click(self, x: Optional[float] = None, y: Optional[float] = None) -> bool:
+        """
+        Land on a point and press it with a real hold duration.
+
+        Uses explicit `down()`/`up()` rather than `page.click()` so the press has
+        a duration: `page.click()` issues a zero-length press, which is both
+        physically implausible and directly measurable by click forensics.
+        """
+        await self._place()
+        if x is not None and y is not None:
+            await self.move_to(x, y)
+        hold = self._rng.lognormvariate(
+            math.log(max(self._model.hold_median_s, 1e-6)), self._model.hold_sigma
+        )
+        hold = min(max(hold, self._model.hold_min_s), self._model.hold_max_s)
+        try:
+            await self._page.mouse.move(self.x, self.y)
+            await self._page.mouse.down()
+            await asyncio.sleep(hold)
+            await self._page.mouse.up()
+        except Exception:
+            return False
+        await asyncio.sleep(self._rng.uniform(*self._model.post_click_s))
+        return True
+
+    async def scroll(
+        self, bursts: int, distance_px: Optional[float] = None, deadline: Optional[float] = None
+    ) -> int:
+        """
+        Read the page: several momentum bursts with pauses between them.
+
+        Returns the number of bursts actually dispatched. Some bursts go upward --
+        a reader returning to a line they skipped -- which a scroll-depth-only
+        model never produces. `deadline` (a monotonic clock value) stops the burst
+        loop early so interaction cannot outlast the visit's budget.
+        """
+        await self._place()
+        dispatched = 0
+        for burst in range(max(0, bursts)):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            steps = self._rng.randint(2, 4)
+            direction = 1.0
+            if self._rng.random() < self._model.wheel_reverse_probability:
+                direction = -1.0
+            deltas = wheel_profile(steps, self._rng, self._model)
+            for delta in deltas:
+                if distance_px is not None:
+                    delta = min(delta, distance_px)
+                try:
+                    await self._page.mouse.wheel(0, direction * delta)
+                except Exception:
+                    return dispatched
+                await asyncio.sleep(self._rng.uniform(*self._model.wheel_step_s))
+            dispatched += 1
+            await asyncio.sleep(self._rng.uniform(*self._model.wheel_burst_pause_s))
+        return dispatched
+
+    async def type_into(
+        self, locator: Any, text: str, deadline: Optional[float] = None
+    ) -> bool:
+        """
+        Focus a field and type with a human cadence.
+
+        Keys are dispatched one at a time with an individually drawn delay rather
+        than through `locator.type(delay=...)`, whose single constant delay cannot
+        express a word boundary or a correction. `deadline` (a monotonic clock
+        value) abandons the entry rather than let typing run past the visit's
+        interaction budget.
+        """
+        try:
+            await locator.click(timeout=3000)
+        except Exception:
+            return False
+        await asyncio.sleep(self._rng.uniform(0.06, 0.25))
+
+        keyboard = self._page.keyboard
+        alphabet = "abcdefghijklmnopqrstuvwxyz"
+        for char, delay in zip(text, keystroke_delays(text, self._rng, self._model)):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if self._rng.random() < self._model.typo_probability and char.isalpha():
+                # A wrong key, noticed, then corrected. Real typing is not
+                # perfect, and a stream with zero errors is a script.
+                wrong = self._rng.choice(alphabet)
+                try:
+                    await keyboard.press(wrong)
+                    await asyncio.sleep(self._rng.uniform(0.12, 0.42))
+                    await keyboard.press("Backspace")
+                    await asyncio.sleep(self._rng.uniform(0.08, 0.30))
+                except Exception:
+                    return False
+            try:
+                await keyboard.press(char)
+            except Exception:
+                return False
+            await asyncio.sleep(delay)
+        return True
+
+
+async def spend_dwell(
+    seconds: float,
+    *,
+    slice_s: float,
+    cancelled: Optional[Callable[[], bool]] = None,
+) -> float:
+    """
+    Spend a planned dwell in slices, so cancellation stays responsive.
+
+    Sleeping the whole dwell in one call would make Stop unclickable for the
+    duration of a long visit, which is the one control that must always work.
+    Returns the seconds actually spent.
+    """
+    remaining = max(0.0, float(seconds))
+    spent = 0.0
+    while remaining > 0:
+        if cancelled is not None and cancelled():
+            break
+        piece = min(remaining, max(0.05, slice_s))
+        await asyncio.sleep(piece)
+        remaining -= piece
+        spent += piece
+    return spent

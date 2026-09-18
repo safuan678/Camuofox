@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
     "CAPABILITIES",
+    "UNCONTROLLABLE_HEADERS",
     "EvasionLevel",
     "EVASION_LEVELS",
     "level_by_id",
@@ -61,6 +62,33 @@ CAPABILITIES: Tuple[str, ...] = (
     "behavior",
     # A durable profile and cookie jar, rather than a throwaway context.
     "persistence",
+)
+
+#: Headers a rung may not rely on controlling.
+#:
+#: Measured on the wire: Firefox generates these itself and will not let a route
+#: override or remove them -- `route.continue_(headers=...)` was asked for each of
+#: them and each arrived unchanged. They are listed so a rung that declares one can
+#: be caught: a header the client cannot actually change is a no-op that reads like
+#: a control, and it would make the rung's `adds` claim false while the ladder's own
+#: consistency check saw nothing wrong.
+#:
+#: `User-Agent`, `Accept`, `Accept-Language` and `Cache-Control` are deliberately
+#: *not* here -- they are settable, and a rung that pins a wrong one is caught by
+#: its own coherence tests (engine/UA agreement, locale agreement) rather than
+#: being dismissed as impossible.
+UNCONTROLLABLE_HEADERS: frozenset = frozenset(
+    {
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "upgrade-insecure-requests",
+        "accept-encoding",
+        "connection",
+        "host",
+        "referer",
+    }
 )
 
 
@@ -107,6 +135,32 @@ class EvasionLevel:
     def is_persistent(self) -> bool:
         """True when this rung is defined by a durable profile."""
         return "persistence" in self.capabilities
+
+    @property
+    def navigation_headers(self) -> Dict[str, str]:
+        """
+        Headers the rung pins on its arrival navigation.
+
+        Only the enforceable subset lives here. Firefox generates `Sec-Fetch-*`,
+        `Upgrade-Insecure-Requests` and `Accept-Encoding` itself, and -- measured,
+        not assumed -- a route cannot override or remove them, so declaring them
+        would be a no-op that reads as a control. What remains is what the rung can
+        actually set on the navigation it sends.
+        """
+        return dict(self.headers)
+
+    @property
+    def context_headers(self) -> Dict[str, str]:
+        """
+        Headers to set context-wide, for every request including subresources.
+
+        Always empty. A navigation header stamped on a stylesheet is a synthetic
+        tell -- `Accept: text/html` on a `.css` request is something no browser
+        produces -- so the rung's headers are applied to the arrival navigation
+        and nowhere else. Kept as a named property so a future rung cannot quietly
+        reintroduce the mistake by writing `extra_http_headers` directly.
+        """
+        return {}
 
     def to_dict(self) -> dict:
         return {
@@ -174,25 +228,42 @@ EVASION_LEVELS: List[EvasionLevel] = [
         key="header_consistency",
         name="L2 - Consistent headers",
         description=(
-            "Headful browser with a coherent navigation header profile: matching "
-            "Accept, Accept-Language, Cache-Control and Sec-Fetch-*. Arrival "
-            "Referer is a journey signal, so it belongs to the behavioral rung, "
-            "not here."
+            "Headful browser with an explicit navigation header profile. On the "
+            "arrival request the browser's own Sec-Fetch-Site: none already "
+            "encodes a direct/typed arrival, so this rung pins the one header it "
+            "can actually control -- the Accept the navigation is sent with, "
+            "stated in Firefox's own form to match the engine and UA it is sent "
+            "from -- and lets the engine generate the rest rather than "
+            "overstating what it changed. Arrival Referer is a journey signal, so "
+            "it belongs to the behavioral rung, not here."
         ),
         client="browser",
         camoufox_options={"headless": False},
         headers={
+            # Only what the rung can actually change. Measured against the wire,
+            # Firefox emits Sec-Fetch-Dest/Mode/Site/User and
+            # Upgrade-Insecure-Requests itself and will not let them be
+            # overridden or dropped, so declaring them here would be a no-op that
+            # reads like a control. Accept is genuinely settable, and on the
+            # arrival navigation the browser's own `Sec-Fetch-Site: none` already
+            # says "typed URL", which is exactly the posture this rung means.
+            #
+            # The value is Firefox's own string, not Chromium's: Camoufox is a
+            # Firefox engine sending a Firefox UA, and `image/avif,image/webp,
+            # image/apng` in that position is Chromium's list. Pinning it would
+            # manufacture the cross-engine inconsistency this audit exists to
+            # detect -- an Accept that belongs to a browser the UA denies being.
+            #
+            # Cache-Control is absent for the same reason: `max-age=0` is
+            # Chromium's reload header and Firefox sends none, so pinning it would
+            # be another engine mismatch. Accept-Language is absent because
+            # Camoufox derives it from the spoofed locale (see
+            # patches/locale-spoofing.patch); pinning it would contradict
+            # `navigator.language` on any non-en-US fingerprint.
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
         },
         capabilities=frozenset({"browser", "headers"}),
         adds="headers",
@@ -218,16 +289,12 @@ EVASION_LEVELS: List[EvasionLevel] = [
             "os": ["windows", "macos", "linux"],
         },
         headers={
+            # The enforceable subset only; see the note on L2. Accept-Language
+            # comes from the spoofed locale, not from here.
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
         },
         capabilities=frozenset({"browser", "headers", "fingerprint"}),
         adds="fingerprint",
@@ -253,16 +320,12 @@ EVASION_LEVELS: List[EvasionLevel] = [
             "os": ["windows", "macos", "linux"],
         },
         headers={
+            # The enforceable subset only; see the note on L2. Accept-Language
+            # comes from the spoofed locale, not from here.
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
         },
         capabilities=frozenset({"browser", "headers", "fingerprint", "ip_rotation"}),
         adds="ip_rotation",
@@ -289,16 +352,12 @@ EVASION_LEVELS: List[EvasionLevel] = [
             "humanize": True,
         },
         headers={
+            # The enforceable subset only; see the note on L2. Accept-Language
+            # comes from the spoofed locale, not from here.
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
         },
         capabilities=frozenset(
             {"browser", "headers", "fingerprint", "ip_rotation", "behavior"}
@@ -328,16 +387,12 @@ EVASION_LEVELS: List[EvasionLevel] = [
             "persistent_context": True,
         },
         headers={
+            # The enforceable subset only; see the note on L2. Accept-Language
+            # comes from the spoofed locale, not from here.
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
         },
         capabilities=frozenset(
             {
@@ -394,6 +449,19 @@ def ladder_problems(levels: Optional[List[EvasionLevel]] = None) -> List[str]:
             problems.append(f"{level.name}: a browser rung must declare 'browser'")
         if level.client == "http" and level.capabilities:
             problems.append(f"{level.name}: an HTTP rung must not claim capabilities")
+        # A header the client cannot actually change makes the rung's `adds` claim
+        # a no-op that still passes the capability check above, so it is caught
+        # separately. See UNCONTROLLABLE_HEADERS.
+        bogus = sorted(
+            name
+            for name in level.headers
+            if name.lower() in UNCONTROLLABLE_HEADERS
+        )
+        if bogus:
+            problems.append(
+                f"{level.name}: declares header(s) {bogus} that the client cannot "
+                f"actually control, so the rung changes nothing on the wire"
+            )
         previous = level.capabilities
     return problems
 

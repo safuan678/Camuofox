@@ -291,6 +291,14 @@ and logs a notice. The mask is weaker: the spoofed fingerprint is not aligned to
 request's IP location or timezone, which a defense comparing the two can detect.
 Install it with `pip install camoufox[geoip]` for the full mask.
 
+**A rotating geoip rung resolves its geography through the proxy** — the rung's
+timezone, locale and WebRTC address are taken from the visitor's proxy exit IP, which
+is why each visitor at such a rung gets its own browser rather than sharing one: a
+shared launch would paint every visitor with the first visitor's geography. A pool
+that verifies exit IPs (`verify_ip: true`) lets the launch reuse that already-verified
+address; an unverified pool is still resolved through the proxy at launch, just at the
+cost of one extra lookup. Both paths keep this host's own IP out of the fingerprint.
+
 Both fallbacks are decisions the runner makes per rung, and both are asserted in
 `pythonlib/tests/test_audit.py` against the assembled launch options rather than
 against a live visit. That suite runs in CI's browser-free `pythonlib` tier, which
