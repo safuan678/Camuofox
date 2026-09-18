@@ -108,6 +108,12 @@ class AuditConfig:
     #: Where per-level artifacts (screenshots, HTML) are written. None = none.
     artifact_dir: Optional[str] = None
     #: Keep the browser open between visitors (much cheaper) or relaunch per visit.
+    #:
+    #: Reuse is the default and it is what the design relies on: one browser serves
+    #: a whole rung, and each visitor opens its own context (which carries its own
+    #: fingerprint). A browser launch costs seconds and a process, so per-visit
+    #: launches turn 100 visitors into 100 Firefox processes -- the dominant cost
+    #: of a run, and a resource shape no human population produces.
     reuse_browser: bool = True
     #: Force the headed/headless posture for every browser rung.
     #:
@@ -151,11 +157,20 @@ class AuditConfig:
             return [level_by_id(i) for i in self.levels]
         return levels_up_to(self.max_evasion_level)
 
-    def schedule_config(self) -> ScheduleConfig:
+    def schedule_config(self, start_at: Optional[Any] = None) -> ScheduleConfig:
+        """
+        The arrival plan for one window.
+
+        `start_at` lets the runner anchor each rung's window to the moment that
+        rung starts. Omitting it means "now", which the schedule then uses both as
+        the window's origin and as the hour the diurnal curve is aligned to -- so a
+        run begun in the afternoon is busy in the afternoon.
+        """
         return ScheduleConfig(
             visitor_count=self.visitor_count,
             duration_hours=self.duration_hours,
             pattern=self.pattern,
+            start_at=start_at,
             max_arrivals_per_minute=self.limits.max_arrivals_per_minute,
         )
 

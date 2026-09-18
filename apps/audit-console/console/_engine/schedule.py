@@ -90,7 +90,14 @@ class ScheduleConfig:
     #: Start of the window; defaults to "now" at schedule time.
     start_at: Optional[datetime] = None
     #: Local hour-of-day the window starts at, used to align the diurnal curve.
-    start_hour: float = 0.0
+    #:
+    #: None means "derive it from `start_at`" (falling back to the current local
+    #: time when `start_at` is also None). Leaving it at a fixed 0.0 -- the original
+    #: default -- anchored the curve to midnight regardless of when the run
+    #: actually started, so a run begun at 14:00 local peaked at 24:00 and idled at
+    #: 10:00. The daily pattern was inverted, which is worse than having no pattern:
+    #: it is a specific, wrong signature.
+    start_hour: Optional[float] = None
     #: Caps that keep a burst from becoming an accidental flood.
     max_arrivals_per_minute: int = 60
     #: Never schedule two arrivals closer than this, in seconds.
@@ -109,6 +116,19 @@ class ScheduleConfig:
             raise ValueError(
                 f"Unknown pattern {self.pattern!r}; expected one of {ArrivalPattern.ALL}"
             )
+
+    def resolved_start_hour(self) -> float:
+        """
+        The hour-of-day the diurnal curve should be anchored to.
+
+        Derived from the window's start so the curve covers the hours the run
+        actually occupies. Callers that mean a specific hour can still pin
+        `start_hour`, which wins.
+        """
+        if self.start_hour is not None:
+            return float(self.start_hour) % 24.0
+        start = self.start_at or datetime.now().astimezone()
+        return (start.hour + start.minute / 60.0 + start.second / 3600.0) % 24.0
 
 
 @dataclass
@@ -181,7 +201,7 @@ class Schedule:
 # window (0.0 = start, 1.0 = end). build_schedule integrates these.
 
 def _rate_human_diurnal(t: float, cfg: ScheduleConfig) -> float:
-    hour = (cfg.start_hour + t * cfg.duration_hours) % 24.0
+    hour = (cfg.resolved_start_hour() + t * cfg.duration_hours) % 24.0
     return diurnal_rate(hour)
 
 
@@ -230,7 +250,12 @@ def build_schedule(config: ScheduleConfig, rng: Optional[random.Random] = None) 
 
     rate_fn = _RATE_FUNCTIONS[config.pattern]
     window_s = config.duration_hours * 3600.0
-    start = config.start_at or datetime.now(timezone.utc)
+    if config.start_at is not None:
+        start = config.start_at
+    else:
+        # Anchor the window to the same clock the diurnal curve is aligned to, so
+        # the two cannot disagree about which hour the run starts at.
+        start = datetime.now().astimezone()
 
     # Dense sampling of the intensity curve, then its cumulative integral.
     steps = 2000

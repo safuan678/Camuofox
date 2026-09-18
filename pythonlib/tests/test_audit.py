@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -706,6 +707,114 @@ def test_a_rung_below_rotation_never_acquires_a_proxy(waf_server, tmp_path):
     assert report.levels[0].level.id == 3
 
 
+def test_a_geoip_rung_resolves_geography_from_the_proxy_not_the_host(monkeypatch):
+    """
+    The fingerprint's timezone and locale must describe the exit IP, not this host.
+
+    `geoip=True` is resolved at *launch* time by Camoufox, but Playwright scopes
+    `proxy` to the *context* -- so launching with the flag and no session baked the
+    host's own IP, timezone and locale into every visitor while the traffic exited
+    from a proxy pool. On the wire that is a browser whose WebRTC address and
+    locale belong to a continent its exit IP is nowhere near, which is the
+    geo/exit mismatch the rung exists to rule out.
+
+    `_has_geoip` is stubbed because geoip2 is an optional extra that CI's
+    browser-free tier does not install; the launch contract is what is under test,
+    not whether this host happens to have the extra.
+    """
+    monkeypatch.setattr(AuditRunner, "_has_geoip", staticmethod(lambda: True))
+    from camoufox.audit.evasion import EVASION_LEVELS
+    from camoufox.proxy import ProxySession, parse_proxy_string
+
+    level = next(lv for lv in EVASION_LEVELS if lv.id == 4)
+    runner = AuditRunner(_config("http://127.0.0.1:1/", levels=[4], visitor_count=1))
+    verified = ProxySession(
+        endpoint=parse_proxy_string("http://127.0.0.1:1"),
+        session_id="s",
+        strategy="file/round_robin",
+        exit_ip="8.8.8.8",
+        verified=True,
+    )
+    # A verified exit is passed straight through, so the launch cannot re-resolve
+    # to a different exit than the context will use.
+    assert runner._launch_options(level, verified)["geoip"] == "8.8.8.8"
+
+
+def test_an_unverified_geoip_rung_still_resolves_through_the_proxy(monkeypatch):
+    """
+    An unverified exit is not a reason to drop geo spoofing -- the proxy answers.
+
+    The fix is the *session*, not the exit IP: with the session in hand,
+    `launch_options` asks the proxy what IP the world sees. Leaving `geoip=True`
+    and letting it resolve through the proxy is correct, and it also spoofs WebRTC
+    and timezone. Disabling geoip here would drop alignment *and* leave WebRTC
+    pointing at this host, which is strictly worse than the bug being fixed.
+    """
+    monkeypatch.setattr(AuditRunner, "_has_geoip", staticmethod(lambda: True))
+    from camoufox.audit.evasion import EVASION_LEVELS
+    from camoufox.proxy import ProxySession, parse_proxy_string
+
+    level = next(lv for lv in EVASION_LEVELS if lv.id == 4)
+    runner = AuditRunner(_config("http://127.0.0.1:1/", levels=[4], visitor_count=1))
+    unverified = ProxySession(
+        endpoint=parse_proxy_string("http://127.0.0.1:1"),
+        session_id="s",
+        strategy="file/round_robin",
+        exit_ip=None,
+    )
+    options = runner._launch_options(level, unverified)
+    assert options["geoip"] is True, (
+        "an unverified exit must still resolve through the proxy, not fall back "
+        "to the host and not be switched off"
+    )
+
+
+def test_a_non_rotating_geoip_rung_needs_no_session(monkeypatch):
+    """L3 has no pool; this host's IP is genuinely the answer there."""
+    monkeypatch.setattr(AuditRunner, "_has_geoip", staticmethod(lambda: True))
+    from camoufox.audit.evasion import EVASION_LEVELS
+
+    level = next(lv for lv in EVASION_LEVELS if lv.id == 3)
+    runner = AuditRunner(_config("http://127.0.0.1:1/", levels=[3], visitor_count=1))
+    assert runner._launch_options(level, None)["geoip"] is True
+
+
+def test_a_proxied_geoip_rung_passes_its_session_to_the_launch():
+    """
+    Without the session the flag resolves this host; the session is the whole fix.
+
+    This asserts the wiring rather than the resolution: `_open_browser` must hand
+    the visitor's session to `AsyncCamoufox`, and `launch_options` must receive it,
+    or the geoip logic above never runs against the right proxy.
+    """
+    import inspect
+
+    from camoufox.audit import runner as runner_mod
+
+    source = inspect.getsource(runner_mod.AuditRunner._open_browser)
+    assert "proxy_session" in source
+    assert 'launch_kwargs["proxy_session"] = proxy_session' in source
+
+
+def test_a_rotating_geoip_rung_never_shares_one_browser():
+    """
+    One shared launch would give every visitor the first visitor's geography.
+
+    The timezone and locale are baked in when the browser starts, so a shared
+    browser cannot serve visitors on different exit IPs -- it would make the
+    fingerprint *more* inconsistent, not less. L4 stays per-visit; L3 (no
+    rotation) may still share.
+    """
+    from camoufox.audit.evasion import EVASION_LEVELS
+
+    runner = AuditRunner(_config("http://127.0.0.1:1/", levels=[4], visitor_count=1))
+    l4 = next(lv for lv in EVASION_LEVELS if lv.id == 4)
+    l3 = next(lv for lv in EVASION_LEVELS if lv.id == 3)
+    assert runner._launch_needs_own_proxy(l4) is True
+    assert l4.requires_rotation and l4.camoufox_options.get("geoip")
+    assert runner._launch_needs_own_proxy(l3) is False
+
+
 def test_rotation_rung_still_acquires_a_proxy(waf_server, tmp_path):
     runner = AuditRunner(
         _config(
@@ -1056,3 +1165,584 @@ def test_persistent_rung_says_the_profile_was_not_exercised(waf_server):
     asyncio.run(runner.run())
     notices = [e for e in events if e.get("event") == "notice"]
     assert any("durable profile" in n.get("message", "") for n in notices), notices
+
+
+# --------------------------------------------------------------------------
+# Realistic human traffic: the fixes that make a run look like visitors
+#
+# These assert the properties the audit claims, at the level where they are
+# decided. Most run without a browser (CI's pythonlib tier never fetches one), so
+# they assert on the plan, the assembled options and the request the runner
+# builds -- the parts that silently regress.
+# --------------------------------------------------------------------------
+
+
+def test_dwell_is_split_across_the_visit_and_sums_to_the_plan():
+    """
+    The dwell must be spent, and spent across the session.
+
+    The original bug was that `plan.dwell_s` was drawn and then never used, so a
+    six-page visit that claimed a minute of attention finished in a few hundred
+    milliseconds. The split has to sum to the draw or the visit is not the length
+    the plan says it is.
+    """
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    rng = random.Random(11)
+    plans = [plan_visit(JourneyConfig(), rng, behavior=True) for _ in range(30)]
+    multi = [p for p in plans if p.page_count > 1]
+    assert multi, "expected some multi-page visits"
+    for plan in multi:
+        assert len(plan.page_dwell_s) == plan.page_count
+        assert abs(sum(plan.page_dwell_s) - plan.dwell_s) < 1e-6
+        # Not an even split: equal reading time per page is its own tell.
+        assert len(set(round(d, 4) for d in plan.page_dwell_s)) > 1
+
+
+def test_non_behavioral_rungs_plan_no_dwell():
+    """A rung below behavior must not claim reading time it does not spend."""
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    plan = plan_visit(JourneyConfig(), random.Random(5), behavior=False)
+    assert plan.dwell_s == 0.0
+    assert plan.page_dwell_s == [0.0]
+
+
+def test_the_dwell_budget_clips_the_tail_without_flattening_short_visits(waf_server):
+    """
+    A 900s outlier becomes a bounded visit; a 20s visit is spent in full.
+
+    The budget exists because the log-normal draw has a long tail: spending it
+    whole would hold a concurrency slot for minutes. Clipping the *total* while
+    keeping short visits intact is what preserves the shape of real attention.
+    """
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    config = _config(waf_server, levels=[5], visitor_count=1)
+    runner = AuditRunner(config)
+    journey = config.journey
+    assert journey.dwell_budget_s > 0
+
+    long_plan = plan_visit(
+        JourneyConfig(dwell_median_s=600.0), random.Random(2), behavior=True
+    )
+    spent_long = sum(
+        runner._page_dwell(long_plan, i) for i in range(long_plan.page_count)
+    )
+    assert spent_long <= journey.dwell_budget_s + 1e-6
+    assert spent_long > 0
+
+    short_plan = plan_visit(
+        JourneyConfig(dwell_median_s=6.0, dwell_min_s=1.0, dwell_max_s=8.0),
+        random.Random(2),
+        behavior=True,
+    )
+    spent_short = sum(
+        runner._page_dwell(short_plan, i) for i in range(short_plan.page_count)
+    )
+    assert abs(spent_short - short_plan.dwell_s) < 1e-6
+
+
+def test_referer_is_sent_on_the_first_navigation_not_context_wide():
+    """
+    The arrival Referer must reach the navigation, and only the navigation.
+
+    Two bugs in one: the referer was never sent at all in a browser rung (the
+    code path was a bare `pass`), and the obvious fix -- putting it in the
+    context's extra headers -- would stamp it on every CSS and image request,
+    which is a synthetic tell rather than a human signal.
+    """
+    import inspect
+
+    from camoufox.audit import runner as runner_module
+
+    source = inspect.getsource(runner_module.AuditRunner._install_navigation_headers)
+    assert "is_navigation_request" in source, (
+        "the referer route must be limited to navigations"
+    )
+    assert "referer" in source
+
+    # And the context-wide headers must not carry a referer.
+    assert "referer" not in {h.lower() for h in level_by_id(5).context_headers}
+
+
+def test_the_uncontrollable_header_set_is_the_measured_one():
+    """
+    This set is a measurement, so a change to it is a change to a claim.
+
+    Each member was asked for through `route.continue_(headers=...)` on a real
+    navigation and arrived unchanged; each excluded name arrived changed. Widening
+    the set would silently excuse a rung from a control it does have; narrowing it
+    would demand a control the engine will not give. Both are wrong in ways that
+    only show up as an unattributable verdict, so the membership is pinned here.
+    """
+    from camoufox.audit.evasion import UNCONTROLLABLE_HEADERS
+
+    assert UNCONTROLLABLE_HEADERS == frozenset(
+        {
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "sec-fetch-user",
+            "upgrade-insecure-requests",
+            "accept-encoding",
+            "connection",
+            "host",
+            "referer",
+        }
+    )
+    # These four *are* settable, and must stay out of the set so a rung that pins
+    # a wrong one is judged by its coherence rather than excused as impossible.
+    for settable in ("user-agent", "accept", "accept-language", "cache-control"):
+        assert settable not in UNCONTROLLABLE_HEADERS
+
+
+def test_no_rung_declares_a_header_the_client_cannot_change():
+    """
+    A header Firefox generates itself is not a control, it is a no-op.
+
+    Measured against the wire, Firefox emits Sec-Fetch-Dest/Mode/Site/User and
+    Upgrade-Insecure-Requests itself and will not let them be overridden or
+    removed -- neither a route that deletes them nor
+    `dom.security.secFetch.enabled=false` changes the bytes. A rung that declares
+    one therefore changes nothing while its `adds` claim reads as though it did,
+    which is exactly the unattributable-verdict failure the ladder exists to
+    prevent. This is the check that would have caught it.
+    """
+    from camoufox.audit.evasion import UNCONTROLLABLE_HEADERS
+
+    for level in EVASION_LEVELS:
+        bogus = sorted(
+            name for name in level.headers if name.lower() in UNCONTROLLABLE_HEADERS
+        )
+        assert not bogus, f"{level.name} declares uncontrollable header(s) {bogus}"
+
+
+def test_the_ladder_reports_no_problems():
+    """The ladder's own consistency check must pass on the shipped rungs."""
+    assert ladder_problems() == []
+
+
+def test_a_rung_never_stamps_its_headers_on_every_request():
+    """
+    A navigation header on a subresource is a synthetic tell.
+
+    `Accept: text/html` on a stylesheet is something no browser produces. The rung
+    headers are applied to the arrival navigation and nowhere else, so the
+    context-wide set is empty -- and any future rung that reintroduces a
+    context-wide header has to fail this first.
+    """
+    for level in EVASION_LEVELS:
+        assert level.context_headers == {}, f"{level.name} sets context-wide headers"
+        # The header set is preserved, just scoped to the arrival navigation.
+        assert set(level.navigation_headers) == set(level.headers)
+
+
+def test_the_arrival_route_does_not_outlive_the_first_navigation():
+    """
+    The header route must detach after the arrival, or it eats the Referer.
+
+    The Referer is set for the arrival and then left alone: a browser derives the
+    referer of every later navigation from the page it is leaving. A route that
+    kept replacing the header set wholesale turned a natural link-follow into a
+    bare request -- measured on the wire, every in-site hop arrived with
+    `Referer: none`, which is a stronger bot signal than the one the route was
+    installed to avoid. The route therefore intercepts exactly one navigation and
+    unroutes itself.
+    """
+    source = (Path(__file__).resolve().parents[1] / "camoufox/audit/runner.py").read_text()
+    start = source.index("async def _install_navigation_headers")
+    body = source[start : source.index("async def _drive_journey")]
+    assert "unroute" in body, "the arrival-header route never detaches"
+    assert "done = True" in body, "the arrival-header route has no single-shot guard"
+
+
+def test_the_hops_a_journey_makes_are_clicks_not_typed_urls():
+    """
+    A reader follows links; they do not retype the address bar mid-session.
+
+    Driving every hop with `goto` makes each navigation a typed-URL navigation --
+    a different and rarer behavior, and one that arrives with no Referer. The
+    journey clicks the anchor instead, falling back to `goto` only when the link
+    is not clickable, so the visit is not lost.
+    """
+    source = (Path(__file__).resolve().parents[1] / "camoufox/audit/runner.py").read_text()
+    assert "async def _follow_link" in source
+    drive = source[source.index("async def _drive_journey") :]
+    assert "_follow_link" in drive, "the journey never follows a link by clicking"
+    # The fallback must still exist, or an unclickable link loses the hop.
+    assert "page.goto(" in drive, "no fallback navigation when a link cannot be clicked"
+
+
+def test_a_visit_touches_the_page_without_touching_a_control():
+    """
+    A visit that only scrolls still has a pointer.
+
+    A page whose sole pointer activity is a wheel is a page no mouse ever visited.
+    The journey emits one pointer move per page (`glance`) so pointer entropy is
+    non-zero even when the visit never reaches a form field.
+    """
+    from camoufox.audit.behavior import Cursor
+
+    assert hasattr(Cursor, "glance")
+    source = (Path(__file__).resolve().parents[1] / "camoufox/audit/runner.py").read_text()
+    drive = source[source.index("async def _drive_journey") :]
+    assert "glance" in drive, "a visit with no form field never moves the pointer"
+
+
+def test_interaction_is_bounded_by_a_budget_not_by_the_whole_dwell():
+    """
+    A long visit is reading time, not a long burst of synthetic activity.
+
+    Interaction is capped by `interaction_budget_s` so that a 45s dwell is not 45s
+    of scrolling -- a rate no human produces and a trivially separable one. The
+    budget is passed down as a monotonic deadline so both scrolling and typing
+    stop at it.
+    """
+    from camoufox.audit.config import JourneyConfig
+
+    budget = JourneyConfig().interaction_budget_s
+    assert 0 < budget <= 20, f"interaction budget {budget}s is not a plausible cap"
+
+    source = (Path(__file__).resolve().parents[1] / "camoufox/audit/runner.py").read_text()
+    drive = source[source.index("async def _drive_journey") :]
+    assert "deadline=stage_deadline" in drive, "the scroll stage ignores the budget"
+    assert "_maybe_type(page, cursor, result, stage_deadline)" in drive, (
+        "the typing stage ignores the budget"
+    )
+
+
+def test_no_rung_pins_an_accept_belonging_to_a_different_engine():
+    """
+    The rung must not send Chromium's Accept from a Firefox UA.
+
+    Camoufox is a Firefox engine and sends a Firefox UA. Chromium's Accept is
+    `text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,
+    image/apng,*/*;q=0.8`; Firefox's is the same but ends
+    `...,*/*;q=0.8` with no per-format image list. Pinning Chromium's value on
+    this engine manufactures exactly the cross-engine inconsistency the audit
+    claims to detect -- an Accept that belongs to a browser the UA denies being.
+    `Cache-Control: max-age=0` is Chromium's reload header and Firefox sends
+    none, so it is disallowed for the same reason.
+    """
+    for level in EVASION_LEVELS:
+        accept = level.headers.get("Accept", "")
+        assert "image/avif" not in accept and "image/webp" not in accept, (
+            f"{level.name} pins a Chromium Accept on a Firefox engine"
+        )
+        assert "cache-control" not in {k.lower() for k in level.headers}, (
+            f"{level.name} pins Chromium's reload header on a Firefox engine"
+        )
+
+
+def test_no_rung_hardcodes_accept_language_against_the_spoofed_locale():
+    """
+    The rung must not pin a language the fingerprint may contradict.
+
+    Camoufox derives Accept-Language from the spoofed locale
+    (`locale:all` -> `intl.accept_languages`), so a rung that hardcodes `en-US`
+    produces `navigator.language = de-DE` alongside `Accept-Language: en-US` on
+    any non-en-US fingerprint -- a one-line inconsistency, and one the audit was
+    manufacturing rather than measuring.
+    """
+    for level in EVASION_LEVELS:
+        for name, value in level.headers.items():
+            if name.lower() == "accept-language":
+                raise AssertionError(
+                    f"{level.name} pins Accept-Language={value!r}; let the engine "
+                    f"derive it from the spoofed locale"
+                )
+
+
+def test_diurnal_curve_is_aligned_to_the_local_start_hour():
+    """
+    A run started in the afternoon must be busy in the afternoon.
+
+    With `start_hour` left at 0.0 the curve was anchored to midnight regardless of
+    the clock, so a 14:00 start peaked at 24:00 and idled at 10:00 -- the daily
+    pattern inverted, which is a specific wrong signature rather than merely a
+    missing one.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from camoufox.audit.schedule import ScheduleConfig, build_schedule
+
+    tz = timezone(timedelta(hours=6))
+    start = datetime(2026, 6, 1, 14, 0, tzinfo=tz)
+    schedule = build_schedule(
+        ScheduleConfig(
+            visitor_count=3000,
+            duration_hours=24.0,
+            pattern=ArrivalPattern.HUMAN_DIURNAL,
+            start_at=start,
+        ),
+        rng=random.Random(2),
+    )
+    buckets = [0] * 24
+    for arrival in schedule.arrivals:
+        buckets[arrival.at.hour % 24] += 1
+
+    # 14:00 is inside the busy plateau; 04:00 is the trough.
+    busy = buckets[14] + buckets[15] + buckets[16]
+    quiet = buckets[3] + buckets[4] + buckets[5]
+    assert busy > quiet, f"afternoon should be busier than the small hours: {buckets}"
+
+
+def test_an_explicit_start_hour_still_wins():
+    """Deriving the hour must not remove the ability to pin one."""
+    from camoufox.audit.schedule import ScheduleConfig
+
+    assert ScheduleConfig(start_hour=9.0).resolved_start_hour() == 9.0
+
+
+def test_each_rung_gets_its_own_schedule_window(waf_server, monkeypatch):
+    """
+    Rungs must not share arrival times, and must not fire as a burst.
+
+    Reusing one schedule across the ladder had two effects. The rungs run in
+    sequence, so from the second rung on the shared window was already in the past
+    and every visitor fired at once -- the opposite of a spread-out arrival
+    pattern. And the timestamps themselves were shared, so a log correlating by
+    time would see a python-urllib client and a masked browser on the same pages in
+    the same seconds: the ladder's own signature.
+    """
+    seen = []
+
+    async def capture(self, level, schedule):
+        seen.append((level.id, [a.offset_s for a in schedule.arrivals]))
+        return LevelResult(level=level)
+
+    monkeypatch.setattr(AuditRunner, "_run_level", capture)
+    asyncio.run(
+        AuditRunner(_config(waf_server, levels=[0, 1, 2], visitor_count=5)).run()
+    )
+    assert [level_id for level_id, _ in seen] == [0, 1, 2]
+    offsets = [tuple(o) for _, o in seen]
+    assert len(set(offsets)) == len(offsets), (
+        "two rungs share an identical arrival pattern; the schedules were reused"
+    )
+
+
+def test_browser_reuse_is_the_default_and_launches_once_per_rung(waf_server, monkeypatch):
+    """
+    One browser per rung, not one per visit.
+
+    The module claimed reuse while `_run_browser_visit` launched a browser per
+    visit, so 100 visitors meant 100 Firefox processes -- the dominant cost of a
+    run, and a resource shape a human population does not produce.
+    """
+    assert AuditConfig(target_url=waf_server).reuse_browser is True
+
+    launches = []
+
+    class FakeManager:
+        def __init__(self, **kwargs):
+            launches.append(kwargs)
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "camoufox.async_api.AsyncCamoufox", lambda **kwargs: FakeManager(**kwargs)
+    )
+
+    async def fake_visit(self, browser, level, plan, url, index, proxy_session):
+        return VisitResult(
+            visitor_index=index,
+            level_id=level.id,
+            started_at=0.0,
+            verdict=Verdict.ALLOWED,
+        )
+
+    monkeypatch.setattr(AuditRunner, "_visit_browser", fake_visit)
+    report = asyncio.run(
+        AuditRunner(_config(waf_server, levels=[2], visitor_count=4)).run()
+    )
+    assert len(launches) == 1, f"expected one launch for the rung, got {len(launches)}"
+    assert report.levels[0].completed == 4
+
+
+def test_per_visit_launch_is_still_available_and_announced(waf_server, monkeypatch):
+    """Turning reuse off must work, and must say what it costs."""
+    launches = []
+
+    class FakeManager:
+        def __init__(self, **kwargs):
+            launches.append(kwargs)
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "camoufox.async_api.AsyncCamoufox", lambda **kwargs: FakeManager(**kwargs)
+    )
+
+    async def fake_visit(self, browser, level, plan, url, index, proxy_session):
+        return VisitResult(
+            visitor_index=index,
+            level_id=level.id,
+            started_at=0.0,
+            verdict=Verdict.ALLOWED,
+        )
+
+    monkeypatch.setattr(AuditRunner, "_visit_browser", fake_visit)
+    events = []
+    asyncio.run(
+        AuditRunner(
+            _config(waf_server, levels=[2], visitor_count=3, reuse_browser=False),
+            on_progress=events.append,
+        ).run()
+    )
+    assert len(launches) == 3, "per-visit mode must launch per visit"
+    notices = [e.get("message", "") for e in events if e.get("event") == "notice"]
+    assert any("reuse_browser is off" in n for n in notices), notices
+
+
+# --------------------------------------------------------------------------
+# Human interaction primitives
+# --------------------------------------------------------------------------
+
+
+def test_cursor_path_is_not_a_straight_line():
+    """A straight interpolation is the most obvious trajectory tell."""
+    from camoufox.audit.behavior import BehaviorModel, cursor_path
+
+    model = BehaviorModel()
+    paths = [
+        cursor_path((0.0, 0.0), (600.0, 400.0), random.Random(seed), model)
+        for seed in range(20)
+    ]
+    assert any(len(p) > 2 for p in paths), "some moves must have intermediate legs"
+    # A leg off the straight line proves the scatter is applied.
+    off_line = False
+    for path in paths:
+        for x, y in path[:-1]:
+            if abs(y - x * (400.0 / 600.0)) > 0.5:
+                off_line = True
+    assert off_line, "no path deviated from the straight line"
+
+
+def test_cursor_path_is_reproducible_from_a_seed():
+    from camoufox.audit.behavior import BehaviorModel, cursor_path
+
+    model = BehaviorModel()
+    first = cursor_path((0.0, 0.0), (300.0, 200.0), random.Random(4), model)
+    second = cursor_path((0.0, 0.0), (300.0, 200.0), random.Random(4), model)
+    assert first == second
+
+
+def test_wheel_deltas_decay_instead_of_repeating():
+    """
+    A momentum burst, not N identical deltas.
+
+    Constant deltas per event are a synthetic-device signature, and they carry no
+    velocity information at all.
+    """
+    from camoufox.audit.behavior import BehaviorModel, wheel_profile
+
+    deltas = wheel_profile(6, random.Random(3), BehaviorModel())
+    assert len(deltas) == 6
+    assert len(set(round(d, 4) for d in deltas)) > 1, "deltas look constant"
+    assert deltas[0] > deltas[-1], "the burst should decay"
+
+
+def test_keystroke_delays_are_right_skewed_and_pause_at_boundaries():
+    """
+    Uniform inter-key delay is a keystroke-dynamics give-away.
+
+    Real cadence has a mode, a tail, and a longer pause at every word boundary.
+    """
+    from camoufox.audit.behavior import BehaviorModel, keystroke_delays
+
+    model = BehaviorModel()
+    text = "hello world again"
+    delays = keystroke_delays(text, random.Random(6), model)
+    assert len(delays) == len(text)
+    assert len(set(round(d, 4) for d in delays)) > 5, "delays look quantised"
+
+    at_spaces = [d for c, d in zip(text, delays) if c == " "]
+    others = [d for c, d in zip(text, delays) if c != " "]
+    assert min(at_spaces) > min(others), "a word boundary should cost extra time"
+
+
+def test_click_has_a_real_hold_duration():
+    """
+    A zero-length press is a machine tell, and click forensics measure it.
+
+    `page.click()` issues down and up with no gap; the cursor primitive must
+    separate them by a drawn duration.
+    """
+    import math
+
+    from camoufox.audit.behavior import BehaviorModel, Cursor
+
+    model = BehaviorModel()
+    holds = []
+    for seed in range(25):
+        rng = random.Random(seed)
+        value = rng.lognormvariate(math.log(model.hold_median_s), model.hold_sigma)
+        holds.append(min(max(value, model.hold_min_s), model.hold_max_s))
+    assert min(holds) > 0.0
+    assert max(holds) <= model.hold_max_s
+    assert model.hold_min_s >= 0.02, "a press shorter than ~20ms is not a human click"
+    assert hasattr(Cursor, "click")
+
+
+def test_cursor_move_tracks_its_position_and_clicks_with_down_up():
+    """The pointer must have a history, and a click must be a held press."""
+    from camoufox.audit.behavior import BehaviorModel, Cursor
+
+    calls = []
+
+    class FakeMouse:
+        async def move(self, x, y):
+            calls.append(("move", x, y))
+
+        async def down(self):
+            calls.append(("down",))
+
+        async def up(self):
+            calls.append(("up",))
+
+        async def wheel(self, dx, dy):
+            calls.append(("wheel", dx, dy))
+
+    class FakePage:
+        mouse = FakeMouse()
+
+        async def evaluate(self, _script):
+            return {"w": 1280, "h": 720}
+
+    async def exercise():
+        cursor = Cursor(FakePage(), random.Random(1), BehaviorModel())
+        await cursor.move_to(500.0, 300.0)
+        assert cursor.x == 500.0 and cursor.y == 300.0
+        assert sum(1 for c in calls if c[0] == "move") > 1, "a move must emit a trajectory"
+
+        calls.clear()
+        assert await cursor.click() is True
+        kinds = [c[0] for c in calls]
+        assert "down" in kinds and "up" in kinds
+        assert kinds.index("down") < kinds.index("up"), "down must precede up"
+
+    asyncio.run(exercise())
+
+
+def test_a_rung_below_behavior_still_gets_no_interaction():
+    """
+    The gate must hold: only L5+ may move a pointer, scroll or type.
+
+    A lower rung that behaved like a human would credit behavior for a verdict
+    that is about static signals.
+    """
+    behavioral = [level.id for level in EVASION_LEVELS if level.is_behavioral]
+    assert behavioral == [5, 6]
+    for level in EVASION_LEVELS:
+        if not level.is_behavioral:
+            assert not (level.camoufox_options or {}).get("humanize")

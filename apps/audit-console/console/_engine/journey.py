@@ -109,6 +109,15 @@ class JourneyConfig:
     dwell_sigma: float = 0.9
     dwell_min_s: float = 8.0
     dwell_max_s: float = 900.0
+    #: Ceiling on the dwell the runner actually spends per visit, in seconds.
+    #:
+    #: The draw above is the *shape*; this is the budget. A visitor planned at 900s
+    #: is not worth 15 minutes of a concurrency slot, and 1000 such visitors would
+    #: run for days -- but spending none of it was the original bug, because a
+    #: session that finishes in a few hundred milliseconds is trivially separable
+    #: from a reader. Visits below the budget are spent in full, so short and long
+    #: visits stay distinguishable; only the tail is clipped.
+    dwell_budget_s: float = 45.0
     #: Pages viewed in one session.
     pages_min: int = 1
     pages_max: int = 6
@@ -124,6 +133,10 @@ class JourneyConfig:
     follow_links_probability: float = 0.6
     #: Ceiling on pages requested from any single path, to avoid hammering one URL.
     max_requests_per_visitor: int = 12
+    #: Per-visit interaction budget, in seconds. Bounds what one visitor can spend
+    #: in mouse movement, scrolling and typing, so a long dwell is reading time
+    #: rather than a burst of synthetic interaction.
+    interaction_budget_s: float = 20.0
 
 
 @dataclass
@@ -139,6 +152,11 @@ class VisitPlan:
     is_bounce: bool
     follow_links: bool
     inter_page_delay_s: List[float] = field(default_factory=list)
+    #: One entry per *request* (the first page plus each subsequent hop): how long
+    #: to spend on that page before acting. Sums to the planned dwell, so the
+    #: reader's time is spread across the session instead of piled on the last
+    #: page.
+    page_dwell_s: List[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -151,6 +169,7 @@ class VisitPlan:
             "is_bounce": self.is_bounce,
             "follow_links": self.follow_links,
             "inter_page_delay_s": [round(d, 2) for d in self.inter_page_delay_s],
+            "page_dwell_s": [round(d, 2) for d in self.page_dwell_s],
         }
 
 
@@ -160,6 +179,24 @@ def _lognormal(median: float, sigma: float, low: float, high: float, rng: random
 
     value = rng.lognormvariate(math.log(max(median, 1e-6)), sigma)
     return float(min(max(value, low), high))
+
+
+def _split_dwell(dwell_s: float, pages: int, rng: random.Random) -> List[float]:
+    """
+    Split a session's dwell into one slice per request.
+
+    Weighted by a random draw rather than divided evenly: an even split would give
+    every page the same reading time, which is the same regularity tell as uniform
+    arrival spacing. The first page gets a floor, because a visitor reads the
+    landing page before clicking anything.
+    """
+    pages = max(1, int(pages))
+    if pages == 1:
+        return [max(0.0, dwell_s)]
+
+    weights = [0.5 + rng.random()] + [rng.random() for _ in range(pages - 1)]
+    total = sum(weights) or 1.0
+    return [dwell_s * (weight / total) for weight in weights]
 
 
 def plan_visit(
@@ -197,6 +234,7 @@ def plan_visit(
             is_bounce=True,
             follow_links=False,
             inter_page_delay_s=[],
+            page_dwell_s=[0.0],
         )
 
     sources = list(config.source_weights.keys())
@@ -223,6 +261,7 @@ def plan_visit(
             is_bounce=True,
             follow_links=False,
             inter_page_delay_s=[],
+            page_dwell_s=[dwell],
         )
 
     pages = rng.randint(config.pages_min, config.pages_max)
@@ -236,14 +275,11 @@ def plan_visit(
         else 0
     )
 
-    # Split the dwell across the session as reading pauses between pages, rather
-    # than sleeping the whole time on the last page.
-    delays: List[float] = []
-    if pages > 1:
-        pools = [rng.random() for _ in range(pages - 1)]
-        total = sum(pools) or 1.0
-        for pool in pools:
-            delays.append(dwell * (pool / total))
+    # Split the dwell across the session as reading pauses, rather than sleeping
+    # the whole time on the last page. The runner spends these slices, so this is
+    # the table that decides how long the visit actually lasts.
+    page_dwell = _split_dwell(dwell, pages, rng)
+    delays = page_dwell[1:]
 
     return VisitPlan(
         source=source,
@@ -255,4 +291,5 @@ def plan_visit(
         is_bounce=False,
         follow_links=rng.random() < config.follow_links_probability,
         inter_page_delay_s=delays,
+        page_dwell_s=page_dwell,
     )

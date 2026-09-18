@@ -20,6 +20,13 @@ tells the operator to turn everything up, which is how a site acquires a WAF tha
 blocks a real customer. Running an ordered ladder of client postures isolates the
 control that is doing the work, so each finding points at one defense.
 
+Traffic realism is a requirement, not a flourish. Arrivals are sampled from a
+diurnal distribution rather than spaced evenly; each browser rung gets its own
+window so no arrival time is shared between postures; and the behavioral rung
+moves a pointer, holds its clicks, scrolls with momentum and types at a drawn
+cadence. A run that is separable from real traffic measures the operator's
+detection of *this tool* rather than the defense under test.
+
 Safety is structural, not advisory:
 
 * nothing runs without an acknowledged :class:`~camoufox.audit.scope.TargetScope`;
@@ -34,6 +41,7 @@ replay credentials. Detecting that a challenge was issued is the finding; solvin
 it would defeat the defense under test and blind the operator to it.
 """
 
+from .behavior import BehaviorModel, Cursor
 from .config import (
     SINGLE_LEVEL_VISITORS,
     AuditConfig,
@@ -46,6 +54,7 @@ from .detection import Verdict, WafDetection, classify_response, detect_vendor
 from .evasion import (
     CAPABILITIES,
     EVASION_LEVELS,
+    UNCONTROLLABLE_HEADERS,
     EvasionLevel,
     ladder_problems,
     level_by_id,
@@ -64,6 +73,9 @@ __all__ = [
     "LevelResult",
     "AuditReport",
     "SINGLE_LEVEL_VISITORS",
+    # behavior
+    "BehaviorModel",
+    "Cursor",
     # scope
     "TargetScope",
     "ScopeViolation",
@@ -77,6 +89,7 @@ __all__ = [
     "EvasionLevel",
     "EVASION_LEVELS",
     "CAPABILITIES",
+    "UNCONTROLLABLE_HEADERS",
     "ladder_problems",
     "level_by_id",
     "levels_up_to",
