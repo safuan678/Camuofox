@@ -1414,6 +1414,75 @@ ApplicationWindow {
                                             }
                                         }
 
+                                        Header {
+                                            Layout.leftMargin: s3
+                                            text: "OUTBOUND FUNNEL (PROMOTIONAL BANNERS)"
+                                        }
+                                        Muted {
+                                            Layout.leftMargin: s3
+                                            Layout.rightMargin: s3
+                                            Layout.fillWidth: true
+                                            wrapMode: Text.WordWrap
+                                            text: "Follow promotional banners the audited page actually serves, and record click-through and landing-page engagement. Only banners pointing at hosts below (or already in scope) are ever followed."
+                                        }
+                                        RowLayout {
+                                            Layout.leftMargin: s3
+                                            spacing: s2
+                                            CheckBox {
+                                                id: funnelBox
+                                                text: "Audit banner click-throughs"
+                                                checked: auditBackend.enableOutboundFunnel
+                                                onToggled: auditBackend.setEnableOutboundFunnel(checked)
+                                            }
+                                        }
+                                        RowLayout {
+                                            Layout.leftMargin: s3
+                                            spacing: s2
+                                            visible: auditBackend.enableOutboundFunnel
+                                            CheckBox {
+                                                id: iframeBox
+                                                text: "Inspect banners inside iframes"
+                                                checked: auditBackend.includeIframes
+                                                onToggled: auditBackend.setIncludeIframes(checked)
+                                            }
+                                        }
+                                        Muted {
+                                            Layout.leftMargin: s3
+                                            Layout.rightMargin: s3
+                                            Layout.fillWidth: true
+                                            wrapMode: Text.WordWrap
+                                            visible: auditBackend.enableOutboundFunnel && !auditBackend.includeIframes
+                                            text: "Main document only. Campaigns served from an ad iframe will not be discovered, and the funnel may report no banner on a page that is showing one."
+                                        }
+                                        Header {
+                                            Layout.leftMargin: s3
+                                            text: "PARTNER CAMPAIGN HOSTS"
+                                            visible: auditBackend.enableOutboundFunnel
+                                        }
+                                        Input {
+                                            Layout.leftMargin: s3
+                                            Layout.rightMargin: s3
+                                            Layout.fillWidth: true
+                                            visible: auditBackend.enableOutboundFunnel
+                                            placeholder: "partner.example.net (optional)"
+                                            Component.onCompleted: text = auditBackend.outboundHosts
+                                            onTextChanged: auditBackend.setOutboundHosts(text)
+                                        }
+                                        Header {
+                                            Layout.leftMargin: s3
+                                            text: "CAMPAIGN INTERACTION RATE (%)"
+                                            visible: auditBackend.enableOutboundFunnel
+                                        }
+                                        Input {
+                                            Layout.leftMargin: s3
+                                            Layout.rightMargin: s3
+                                            Layout.fillWidth: true
+                                            visible: auditBackend.enableOutboundFunnel
+                                            placeholder: "2.5"
+                                            Component.onCompleted: text = auditBackend.campaignRatePct
+                                            onTextChanged: auditBackend.setCampaignRatePct(text)
+                                        }
+
                                         // Authorization gate
                                         Rectangle {
                                             Layout.leftMargin: s3
@@ -1932,6 +2001,64 @@ ApplicationWindow {
                                                     text: modelData.vendors
                                                     color: c.accent
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Outbound funnel card. Shown only when the run
+                                // measured click-throughs, so an ordinary audit
+                                // does not grow an empty panel.
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: funnelCol.implicitHeight + s3 * 2
+                                    visible: !!auditBackend.summary
+                                             && !!auditBackend.summary.funnel
+                                             && auditBackend.summary.funnel.enabled === true
+                                    color: c.bg
+                                    border.color: c.muted
+                                    border.width: 1
+                                    radius: s1
+
+                                    ColumnLayout {
+                                        id: funnelCol
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.top: parent.top
+                                        anchors.margins: s3
+                                        spacing: s1
+
+                                        T {
+                                            text: "Outbound funnel"
+                                            color: c.accent
+                                        }
+                                        Muted {
+                                            text: "Interaction rate " + (auditBackend.summary.funnel.ratePct || 0)
+                                                  + "%  clicks " + (auditBackend.summary.funnel.clicks || 0)
+                                                  + "  landed " + (auditBackend.summary.funnel.landed || 0)
+                                                  + "  engaged " + (auditBackend.summary.funnel.engaged || 0)
+                                        }
+                                        Muted {
+                                            text: "First-party " + (auditBackend.summary.funnel.firstPartyClicks || 0)
+                                                  + "  partner " + (auditBackend.summary.funnel.partnerClicks || 0)
+                                                  + "  refused " + (auditBackend.summary.funnel.refused || 0)
+                                                  + "  unreachable " + (auditBackend.summary.funnel.unreachable || 0)
+                                        }
+                                        Muted {
+                                            visible: auditBackend.summary.funnel.dwellP50 !== undefined
+                                                     && auditBackend.summary.funnel.dwellP50 !== null
+                                            text: "Dwell p50 " + (auditBackend.summary.funnel.dwellP50 || 0) + "s "
+                                                  + "(min " + (auditBackend.summary.funnel.dwellMin || 0) + "s, "
+                                                  + "max " + (auditBackend.summary.funnel.dwellMax || 0) + "s)"
+                                        }
+                                        Repeater {
+                                            model: auditBackend.summary.funnel.destinations || []
+                                            delegate: Muted {
+                                                required property var modelData
+                                                text: "→ " + modelData.url + "  (" + modelData.clicks + " click"
+                                                      + (modelData.clicks === 1 ? "" : "s") + ")"
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
                                             }
                                         }
                                     }

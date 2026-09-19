@@ -26,16 +26,25 @@ tell: real reading time is right-skewed, with most visits short and a long tail.
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 __all__ = [
     "ArrivalSource",
     "JourneyConfig",
     "VisitPlan",
+    "BannerCandidate",
+    "OutboundPlan",
     "plan_visit",
+    "plan_outbound_visit",
     "build_arrival_referer",
+    "discover_banner_candidates",
+    "is_ad_syndication_url",
+    "parse_rate_pct",
+    "roll_outbound_trigger",
+    "select_campaign",
 ]
 
 #: Real search engines and a couple of common referral hosts. A visitor that
@@ -292,4 +301,356 @@ def plan_visit(
         follow_links=rng.random() < config.follow_links_probability,
         inter_page_delay_s=delays,
         page_dwell_s=page_dwell,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outbound funnel: promotional banners and the campaign click-through
+# ---------------------------------------------------------------------------
+#
+# The funnel audit asks a different question from the evasion ladder: not "does
+# the defense hold", but "does the campaign banner reach its destination, and
+# does a visitor who clicks it get tracked through". It runs *on top of* a rung
+# rather than as a rung of its own, because a click-through is a property of a
+# human-shaped posture -- it is only meaningful on a rung that already claims
+# behavior. Everything in this section is therefore pure: it decides, from what
+# the page shows, what a visitor would plausibly click.
+
+#: Result of `parse_rate_pct`: the operator's "2.5" means 2.5 percent.
+PCT_MIN = 0.0
+PCT_MAX = 30.0
+
+#: The shape of a percentage the GUI and CLI accept. Deliberately strict: a rate
+#: is a quantity that decides how much traffic leaves, so "2.5%" is read as 2.5
+#: and a malformed value is refused rather than guessed at.
+_PCT_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$")
+
+
+def parse_rate_pct(value: Any) -> float:
+    """
+    Parse an operator-entered campaign rate into a percentage float.
+
+    Accepts what a spinbox or a text field realistically produces: `2.5`, `2.5%`,
+    ` 2.5 %`, `"2.5"`, `"0.1"`. Rejects anything else with `ValueError` rather
+    than coercing it, because a silently misread rate is traffic the operator did
+    not authorize. Clamps to the ladder's supported range so a value out of range
+    cannot widen the run beyond what the UI offers.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"Not a campaign rate: {value!r}")
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        match = _PCT_RE.match(str(value or ""))
+        if not match:
+            raise ValueError(f"Not a campaign rate: {value!r}")
+        number = float(match.group(1))
+    if number != number:  # NaN
+        raise ValueError(f"Not a campaign rate: {value!r}")
+    return min(max(number, PCT_MIN), PCT_MAX)
+
+
+#: Ad-syndication and programmatic-exchange hosts.
+#:
+#: The funnel is about *first-party and direct partner* campaigns. A banner that
+#: points into a real-time bidding exchange or an ad network is not a campaign
+#: link -- clicking it measures the exchange's redirect chain, not the site's
+#: funnel -- and it would drag the audit onto hosts nobody authorized. These are
+#: filtered before a destination is ever considered.
+_AD_SYNDICATION_MARKERS: Tuple[str, ...] = (
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com/ads",
+    "adservice.google.",
+    "amazon-adsystem.com",
+    "taboola.com",
+    "outbrain.com",
+    "criteo.",
+    "pubmatic.com",
+    "rubiconproject.com",
+    "openx.net",
+    "adnxs.com",
+    "casalemedia.com",
+    "smartadserver.com",
+    "sharethrough.com",
+    "teads.tv",
+    "mgid.com",
+    "revcontent.com",
+    "zergnet.com",
+    "yieldmo.com",
+    "sitescout.com",
+    "bidswitch.net",
+    "360yield.com",
+    "improvedigital.com",
+    "adform.net",
+    "adsrvr.org",
+    "1rx.io",
+)
+
+#: Query parameters that mark a URL as a click-wrapper/redirector rather than a
+#: destination. A direct campaign link has a real path; an exchange hands over
+#: its own endpoint with the destination buried in a parameter.
+_REDIRECT_PARAM_MARKERS: Tuple[str, ...] = (
+    "adurl",
+    "adurl=",
+    "gclid",
+    "gbraid",
+    "wbraid",
+    "gad_source",
+    "fbclid",
+    "msclkid",
+    "dclid",
+    "twclid",
+    "ttclid",
+    "yclid",
+    "utm_source=adwords",
+)
+
+
+def is_ad_syndication_url(url: str) -> bool:
+    """
+    True when a URL points at an ad exchange, syndication network or wrapper.
+
+    Filtering happens on the *host and query*, not on the anchor's class, because
+    a class name is a claim the page makes about itself while the destination is
+    what the audit would actually contact. A link that redirects through an
+    exchange is refused for the same reason a link to one is.
+    """
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return True
+    for marker in _AD_SYNDICATION_MARKERS:
+        # A trailing dot marks a prefix family (`criteo.` matches criteo.com and
+        # criteo.net, and `adservice.google.` its subdomains). It must sit on a
+        # label boundary, so `notcriteo.com` does not match.
+        if marker.endswith("."):
+            if host.startswith(marker) or ("." + marker) in host:
+                return True
+        elif host == marker or host.endswith("." + marker):
+            return True
+    blob = (parsed.query or "").lower() + " " + (parsed.netloc or "").lower()
+    for marker in _REDIRECT_PARAM_MARKERS:
+        if marker in blob:
+            return True
+    return False
+
+
+@dataclass
+class BannerCandidate:
+    """One promotional banner the page offered, and what it points at."""
+
+    url: str
+    selector_hint: str = ""
+    text: str = ""
+    #: True when the destination is inside the audited site rather than a partner.
+    first_party: bool = False
+    #: True when the outbound gate admitted the destination for this session.
+    authorized: bool = False
+    #: Why the gate refused it, when it did. Kept so the report can name the
+    #: refused destination instead of silently dropping it.
+    refusal: str = ""
+    #: Which frame the banner was found in: 0 is the main document, and positive
+    #: values are the child frames in `page.frames` order.
+    #:
+    #: An ordinal rather than the frame's URL, because a frame's URL can be empty
+    #: (`about:blank`, `srcdoc`) or shared by two frames, and the click has to
+    #: resolve back to *the* frame the banner was seen in. Pairing the candidate
+    #: with the wrong frame would aim the cursor at another frame's geometry.
+    frame_index: int = 0
+
+    @property
+    def from_iframe(self) -> bool:
+        """True when this banner was found in a child frame, not the main document."""
+        return self.frame_index > 0
+
+    def to_dict(self) -> dict:
+        return {
+            "url": self.url,
+            "selector_hint": self.selector_hint,
+            "text": self.text,
+            "first_party": self.first_party,
+            "authorized": self.authorized,
+            "refusal": self.refusal,
+            "frame_index": self.frame_index,
+            "from_iframe": self.from_iframe,
+        }
+
+
+def discover_banner_candidates(
+    anchors: Sequence[Any],
+    *,
+    page_url: str,
+    scope: Any = None,
+    limit: int = 60,
+    include_iframes: bool = True,
+) -> List[BannerCandidate]:
+    """
+    Turn the page's anchors into the promotional candidates worth considering.
+
+    `anchors` is what the page reported -- a list of mappings with `href`, and
+    optionally `text`, `selector` and `frame_index`, produced by the discovery
+    script in the runner. Keeping this a pure function of that data is what makes
+    the filtering testable without a browser.
+
+    Filtering, in order: a resolvable http(s) destination; not an ad-exchange
+    wrapper; and a deduplication pass. When a `scope` is given, a destination the
+    outbound gate refuses is *kept* with `authorized=False` and a `refusal`
+    reason rather than dropped, so the audit can report that a third-party or
+    undeclared banner existed and was deliberately not followed. Only authorized
+    candidates are ever eligible for selection (`select_campaign` filters on
+    `authorized`), so keeping the refused ones cannot cause traffic.
+
+    `include_iframes=False` drops every anchor reported from a child frame, which
+    is how an operator restricts discovery to the main document. The policy lives
+    here rather than only in the runner so it is a pure, testable decision -- and
+    so there is one place that decides it, not one per call site.
+    """
+    seen = set()
+    candidates: List[BannerCandidate] = []
+    base = urlparse(page_url)
+
+    for anchor in anchors or []:
+        href = ""
+        frame_index = 0
+        if isinstance(anchor, dict):
+            href = str(anchor.get("href") or "").strip()
+            try:
+                frame_index = max(0, int(anchor.get("frame_index") or 0))
+            except (TypeError, ValueError):
+                frame_index = 0
+        elif isinstance(anchor, str):
+            href = anchor.strip()
+        if not href:
+            continue
+        # An iframe banner the operator asked not to inspect is dropped before the
+        # gate, so excluding frames cannot leave the frame's destination counted
+        # in the refused-banner evidence either.
+        if frame_index > 0 and not include_iframes:
+            continue
+
+        parsed = urlparse(href)
+        if (parsed.scheme or "").lower() not in ("http", "https"):
+            continue
+        if not parsed.hostname:
+            continue
+        # A same-document fragment is not a destination.
+        if _same_document(parsed, base):
+            continue
+        key = href.split("#", 1)[0]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if is_ad_syndication_url(href):
+            continue
+
+        candidate = BannerCandidate(
+            url=href,
+            selector_hint=str(anchor.get("selector") or "") if isinstance(anchor, dict) else "",
+            text=str(anchor.get("text") or "")[:120] if isinstance(anchor, dict) else "",
+            frame_index=frame_index,
+        )
+        if scope is not None:
+            candidate.first_party = scope.permits_url(href)
+            candidate.authorized = scope.check_unattended(href)
+            if not candidate.authorized:
+                candidate.refusal = (
+                    "the destination host is a partner host that was not declared "
+                    "in the outbound scope"
+                )
+        else:
+            candidate.authorized = True
+        candidates.append(candidate)
+        if len(candidates) >= max(1, int(limit)):
+            break
+    return candidates
+
+
+def _same_document(parsed, base) -> bool:
+    return bool(
+        parsed.hostname == base.hostname
+        and (parsed.path or "/") == (base.path or "/")
+        and parsed.query == base.query
+    )
+
+
+@dataclass
+class OutboundPlan:
+    """What one visitor does about the funnel: whether, and to which banner."""
+
+    triggered: bool
+    campaign_url: Optional[str] = None
+    selector_hint: str = ""
+    first_party: bool = True
+    #: The frame the chosen banner was found in (0 = the main document). Carried
+    #: through the plan because the click has to resolve back to that frame: the
+    #: same href can exist in two frames, and pressing the wrong one would move
+    #: the cursor to another frame's geometry.
+    frame_index: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "triggered": self.triggered,
+            "campaign_url": self.campaign_url,
+            "selector_hint": self.selector_hint,
+            "first_party": self.first_party,
+            "frame_index": self.frame_index,
+        }
+
+
+def roll_outbound_trigger(
+    rate_pct: float, rng: random.Random, *, uniform: Optional[float] = None
+) -> bool:
+    """
+    The per-session CTR roll: `uniform(0, 100) < rate_pct`.
+
+    `uniform` lets a caller supply the draw, which makes the roll deterministic in
+    tests without reaching into the RNG's state.
+    """
+    draw = rng.uniform(0.0, 100.0) if uniform is None else float(uniform)
+    return draw < float(rate_pct)
+
+
+def select_campaign(
+    candidates: Sequence[BannerCandidate], rng: random.Random
+) -> Optional[BannerCandidate]:
+    """
+    Choose one banner uniformly from the candidates.
+
+    `random.choice()` over the whole set, not weighted by position or size: a
+    visitor picks what catches their eye, and a distribution that favours the
+    first banner is the pattern a funnel audit exists to *find*, not to emit.
+    """
+    usable = [c for c in candidates if c.authorized]
+    if not usable:
+        return None
+    return rng.choice(usable)
+
+
+def plan_outbound_visit(
+    rate_pct: float,
+    candidates: Sequence[BannerCandidate],
+    rng: random.Random,
+) -> OutboundPlan:
+    """
+    Decide whether this visitor clicks a banner, and which one.
+
+    Planning before touching the network keeps the roll and the choice together:
+    a visitor who did not trigger should not later discover a banner, and one who
+    did should not have the destination chosen by whatever the page happens to
+    render first.
+    """
+    if not roll_outbound_trigger(rate_pct, rng):
+        return OutboundPlan(triggered=False)
+    chosen = select_campaign(candidates, rng)
+    if chosen is None:
+        return OutboundPlan(triggered=False)
+    return OutboundPlan(
+        triggered=True,
+        campaign_url=chosen.url,
+        selector_hint=chosen.selector_hint,
+        first_party=chosen.first_party,
+        frame_index=chosen.frame_index,
     )

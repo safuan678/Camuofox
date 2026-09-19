@@ -38,6 +38,7 @@ from ..audit import (
     SafetyLimits,
     TargetScope,
     build_schedule,
+    parse_rate_pct,
 )
 from ..audit.detection import Verdict as _Verdict
 from ..audit.report import build_findings, render_text, write_report
@@ -195,9 +196,15 @@ class AuditBackend(QObject):
         # --- target / scope ---------------------------------------------
         self._target = ""
         self._scope_hosts = ""
+        self._outbound_hosts = ""
         self._allow_subdomains = False
         self._acknowledged = False
         self._ack_note = ""
+
+        # --- outbound funnel ---------------------------------------------
+        self._enable_funnel = False
+        self._campaign_rate = "2.5"
+        self._include_iframes = True
 
         # --- traffic plan ------------------------------------------------
         self._visitors = 100
@@ -318,6 +325,45 @@ class AuditBackend(QObject):
         self._allow_subdomains = bool(value)
         self.changed.emit()
         self._refresh_preview()
+
+    @Property(str, notify=changed)
+    def outboundHosts(self):
+        """Partner campaign hosts the operator authorizes for outbound follow-ups."""
+        return self._outbound_hosts
+
+    @Slot(str)
+    def setOutboundHosts(self, value: str) -> None:
+        self._outbound_hosts = value or ""
+        self.changed.emit()
+        self._refresh_preview()
+
+    @Property(bool, notify=changed)
+    def enableOutboundFunnel(self):
+        return self._enable_funnel
+
+    @Slot(bool)
+    def setEnableOutboundFunnel(self, value: bool) -> None:
+        self._enable_funnel = bool(value)
+        self.changed.emit()
+
+    @Property(str, notify=changed)
+    def campaignRatePct(self):
+        return self._campaign_rate
+
+    @Slot(str)
+    def setCampaignRatePct(self, value: str) -> None:
+        self._campaign_rate = value or ""
+        self.changed.emit()
+
+    @Property(bool, notify=changed)
+    def includeIframes(self):
+        """Whether banner discovery looks inside child frames."""
+        return self._include_iframes
+
+    @Slot(bool)
+    def setIncludeIframes(self, value: bool) -> None:
+        self._include_iframes = bool(value)
+        self.changed.emit()
 
     @Property(bool, notify=changed)
     def acknowledged(self):
@@ -687,9 +733,33 @@ class AuditBackend(QObject):
             return
 
         hosts = [h.strip() for h in self._scope_hosts.replace(",", " ").split() if h.strip()]
+        outbound = [h.strip() for h in self._outbound_hosts.replace(",", " ").split() if h.strip()]
+        if self._enable_funnel:
+            # First-party-only funnels are legitimate (an on-site promotion), so
+            # this is not an error; but the operator should know that a partner
+            # banner will be refused before the run rather than after.
+            try:
+                rate = parse_rate_pct(self._campaign_rate)
+            except ValueError:
+                self._error = (
+                    f"Campaign interaction rate {self._campaign_rate!r} is not a "
+                    f"number; give a percentage like 2.5."
+                )
+                self.changed.emit()
+                return
+            if rate <= 0:
+                self._error = (
+                    "Campaign interaction rate is 0, so no visitor would click a "
+                    "banner and the funnel would measure nothing."
+                )
+                self.changed.emit()
+                return
         try:
             scope = TargetScope.from_urls(
-                hosts, allow_subdomains=self._allow_subdomains, acknowledged=True
+                hosts,
+                allow_subdomains=self._allow_subdomains,
+                acknowledged=True,
+                outbound_urls=outbound,
             )
         except Exception as exc:
             self._error = f"Invalid scope: {exc}"
@@ -729,6 +799,9 @@ class AuditBackend(QObject):
             max_evasion_level=self._max_level,
             single_level_mode=self._single_level_mode,
             single_level=self._single_level,
+            enable_outbound_funnel=self._enable_funnel,
+            outbound_campaign_rate_pct=self._campaign_rate,
+            include_iframes=self._include_iframes,
             visitor_count=self._visitors,
             duration_hours=self._hours,
             pattern=ArrivalPattern.ALL[self._pattern_index],
@@ -817,6 +890,38 @@ class AuditBackend(QObject):
                 f"detected {level.get('detection_rate', 0):.0%}"
             )
 
+    def _funnel_summary_for(self, payload: dict) -> dict:
+        """
+        Flatten the run's funnel section for the QML summary panel.
+
+        Kept as a plain dict of already-formatted strings so the QML side only
+        renders, never computes -- the CTR and dwell figures must come from the
+        same place the reports do, or the GUI and the file would disagree.
+        """
+        funnel = payload.get("funnel") or {}
+        if not funnel.get("enabled"):
+            return {"enabled": False}
+        rate = funnel.get("rate_pct")
+        return {
+            "enabled": True,
+            "ratePct": rate,
+            "clicks": funnel.get("clicks", 0),
+            "landed": funnel.get("landed", 0),
+            "engaged": funnel.get("engaged", 0),
+            "partnerClicks": funnel.get("partner_clicks", 0),
+            "firstPartyClicks": funnel.get("first_party_clicks", 0),
+            "refused": funnel.get("refused", 0),
+            "unreachable": funnel.get("unreachable", 0),
+            "skippedByScope": funnel.get("skipped_by_scope", 0),
+            "dwellP50": funnel.get("dwell_p50_s"),
+            "dwellMin": funnel.get("dwell_min_s"),
+            "dwellMax": funnel.get("dwell_max_s"),
+            "destinations": [
+                {"url": d.get("url", ""), "clicks": d.get("clicks", 0)}
+                for d in (funnel.get("destinations") or [])
+            ],
+        }
+
     @Slot(dict, str)
     def _on_finished(self, payload: dict, payload_json: str) -> None:
         self._running = False
@@ -834,6 +939,7 @@ class AuditBackend(QObject):
             "duration": round(payload.get("duration_s", 0.0), 1),
             "aborted": payload.get("aborted", False),
             "abortReason": payload.get("abort_reason", ""),
+            "funnel": self._funnel_summary_for(payload),
             "levels": [
                 {
                     "name": lv.get("level_name", ""),

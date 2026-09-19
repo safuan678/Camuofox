@@ -149,7 +149,102 @@ def build_findings(report: AuditReport) -> List[str]:
     for warning in report.schedule_warnings:
         findings.append(f"Scheduling caveat: {warning}")
 
+    findings.extend(_funnel_findings(report))
+
     return findings
+
+
+def _funnel_findings(report: AuditReport) -> List[str]:
+    """
+    The campaign click-through conclusion, kept separate from the attribution.
+
+    A CTR and "the defenses hold at L3" answer different questions, and a report
+    that merges them invites reading a banner's click-through rate as a defense
+    result. So the funnel gets its own lines, and the rung a click happened on is
+    named explicitly.
+    """
+    if not report.config.enable_outbound_funnel:
+        return []
+
+    funnel = report.funnel_summary()
+    lines: List[str] = []
+
+    if funnel["clicks"] == 0:
+        lines.append(
+            "Outbound funnel auditing ran but no visitor clicked a promotional "
+            "banner. Either no authorized banner was present on the audited page, "
+            "or the interaction rate was too low for the sample size."
+        )
+        if not report.config.scope.outbound_hosts:
+            lines.append(
+                "No partner destinations were declared in the scope, so partner "
+                "banners were refused before being followed. Declare campaign hosts "
+                "to follow them."
+            )
+        return lines
+
+    rate = funnel["rate_pct"]
+    lines.append(
+        f"Outbound funnel: {funnel['clicks']} of the sampled visitors clicked a "
+        f"promotional banner (interaction rate set to {rate:g}%), and "
+        f"{funnel['landed']} of those reached the destination "
+        f"({funnel['landing_rate']:.0%} landing rate)."
+    )
+
+    if funnel["partner_clicks"]:
+        lines.append(
+            f"{funnel['first_party_clicks']} click-through(s) stayed on the audited "
+            f"site and {funnel['partner_clicks']} left for a declared partner "
+            f"destination."
+        )
+
+    dwell_p50 = funnel["dwell_p50_s"]
+    if dwell_p50 is not None:
+        lines.append(
+            f"Landing-page engagement: median {dwell_p50:g}s "
+            f"(range {funnel['dwell_min_s']:g}s-{funnel['dwell_max_s']:g}s), which is "
+            f"the attention a visitor gave the destination, not the site under audit."
+        )
+    elif funnel["clicks"]:
+        lines.append(
+            "No click-through reached a destination that served the offer, so there "
+            "is no landing-page engagement to report."
+        )
+
+    if funnel["refused"]:
+        lines.append(
+            f"{funnel['refused']} click-through(s) landed but were refused, so the "
+            f"campaign link resolved and the offer was not served -- worth checking "
+            f"whether the tracker or the destination is responsible."
+        )
+    if funnel["unreachable"]:
+        lines.append(
+            f"{funnel['unreachable']} click-through(s) could not be opened at all; "
+            f"check connectivity to the destination."
+        )
+    if funnel["skipped_by_scope"]:
+        lines.append(
+            f"{funnel['skipped_by_scope']} click-through(s) were refused by the "
+            f"scope gate because the banner pointed at an undeclared host."
+        )
+
+    destinations = funnel["destinations"]
+    if destinations:
+        top = destinations[:3]
+        lines.append(
+            "Campaign destinations reached: "
+            + ", ".join(f"{d['url']} (x{d['clicks']})" for d in top)
+            + "."
+        )
+
+    if not report.config.scope.outbound_hosts:
+        lines.append(
+            "Only first-party (in-scope) banners were followable, because no partner "
+            "destinations were declared; partner banners were refused and are not "
+            "counted above."
+        )
+
+    return lines
 
 
 def render_text(report: AuditReport) -> str:
@@ -209,6 +304,36 @@ def render_text(report: AuditReport) -> str:
             add(f"  ABORTED: {lr.abort_reason}")
         add("")
 
+    if report.config.enable_outbound_funnel:
+        add("-" * 72)
+        add("OUTBOUND FUNNEL & CAMPAIGN CTR")
+        add("-" * 72)
+        funnel = report.funnel_summary()
+        add(f"  interaction rate : {funnel['rate_pct']:g}%")
+        add(f"  scan scope       : {'main document + iframes' if report.config.include_iframes else 'main document only'}")
+        add(f"  declared partners: {', '.join(report.config.scope.outbound_hosts) or '(none)'}")
+        add(f"  admitted  this run: {', '.join(sorted(report.config.scope.session_outbound)) or '(none)'}")
+        add(f"  clicks           : {funnel['clicks']} (first-party {funnel['first_party_clicks']}, "
+            f"partner {funnel['partner_clicks']})")
+        add(f"  landed           : {funnel['landed']} ({funnel['landing_rate']:.0%} of clicks)")
+        add(f"  engaged          : {funnel['engaged']} (landed and served the offer)")
+        if funnel["refused"]:
+            add(f"  refused          : {funnel['refused']} (landed but not served)")
+        if funnel["iframe_clicks"]:
+            add(f"  from iframes     : {funnel['iframe_clicks']}")
+        if funnel["unreachable"]:
+            add(f"  unreachable      : {funnel['unreachable']}")
+        if funnel["skipped_by_scope"]:
+            add(f"  refused by scope : {funnel['skipped_by_scope']}")
+        if funnel["dwell_p50_s"] is not None:
+            add(f"  landing dwell    : p50 {funnel['dwell_p50_s']:g}s "
+                f"({funnel['dwell_min_s']:g}s-{funnel['dwell_max_s']:g}s)")
+        if funnel["destinations"]:
+            add("  destinations:")
+            for entry in funnel["destinations"]:
+                add(f"    x{entry['clicks']:<4} {entry['url']}")
+        add("")
+
     return "\n".join(lines) + "\n"
 
 
@@ -243,10 +368,18 @@ def write_csv(report: AuditReport, path: str) -> Path:
             "exit_ip",
             "reason",
             "vendors",
+            "campaign_url",
+            "campaign_first_party",
+            "campaign_frame_index",
+            "campaign_interaction",
+            "campaign_landed",
+            "campaign_landing_status",
+            "campaign_dwell_s",
         ]
     )
     for lr in report.levels:
         for visit in lr.visits:
+            campaign = visit.campaign
             writer.writerow(
                 [
                     visit.visitor_index,
@@ -264,6 +397,13 @@ def write_csv(report: AuditReport, path: str) -> Path:
                     visit.exit_ip or "",
                     visit.reason,
                     ";".join(visit.vendors),
+                    campaign.campaign_url if campaign else "",
+                    campaign.first_party if campaign else "",
+                    campaign.frame_index if campaign else "",
+                    campaign.interaction if campaign else "",
+                    campaign.landed if campaign else "",
+                    campaign.landing_status if campaign and campaign.landing_status is not None else "",
+                    f"{campaign.dwell_s:.3f}" if campaign else "",
                 ]
             )
     target.write_text(buffer.getvalue(), encoding="utf-8")
@@ -309,6 +449,33 @@ def render_html(report: AuditReport) -> str:
             f"<dt>Highest rung that got through</dt>"
             f"<dd>{esc(bypassing.level.name) if bypassing else 'none got through'}</dd>"
         )
+
+    funnel_html = ""
+    if report.config.enable_outbound_funnel:
+        funnel = report.funnel_summary()
+        dest_rows = "".join(
+            f"<tr><td>{esc(d['url'])}</td><td class='n'>{d['clicks']}</td></tr>"
+            for d in funnel["destinations"]
+        ) or "<tr><td colspan='2'>no destination reached</td></tr>"
+        dwell = (
+            f"{funnel['dwell_p50_s']:g}s median, {funnel['dwell_min_s']:g}s-"
+            f"{funnel['dwell_max_s']:g}s"
+            if funnel["dwell_p50_s"] is not None
+            else "n/a"
+        )
+        funnel_html = f"""
+<h2>Outbound funnel &amp; campaign CTR</h2>
+<div class="card"><dl class="kv">
+ <dt>Interaction rate</dt><dd>{funnel['rate_pct']:g}%</dd>
+ <dt>Declared partners</dt><dd>{esc(', '.join(report.config.scope.outbound_hosts) or '(none)')}</dd>
+ <dt>Admitted this run</dt><dd>{esc(', '.join(sorted(report.config.scope.session_outbound)) or '(none)')}</dd>
+ <dt>Banner clicks</dt><dd>{funnel['clicks']} (first-party {funnel['first_party_clicks']}, partner {funnel['partner_clicks']})</dd>
+ <dt>Landed</dt><dd>{funnel['landed']} ({funnel['landing_rate']:.0%} of clicks)</dd>
+ <dt>Landing dwell</dt><dd>{dwell}</dd>
+</dl></div>
+<table><thead><tr><th>Campaign destination</th><th class="n">Clicks</th></tr></thead>
+<tbody>{dest_rows}</tbody></table>
+"""
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -358,7 +525,7 @@ def render_html(report: AuditReport) -> str:
  <th>Level</th><th class="n">Visits</th><th class="n">Bypass</th>
  <th class="n">Detected</th><th>Outcomes</th><th>Products seen</th>
 </tr></thead><tbody>{"".join(rows)}</tbody></table>
-
+{funnel_html}
 <p class="note">Generated by the Camoufox audit tool. Verify the target was properly
 authorized before sharing this report.</p>
 </div></body></html>

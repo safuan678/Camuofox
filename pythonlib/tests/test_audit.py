@@ -1746,3 +1746,942 @@ def test_a_rung_below_behavior_still_gets_no_interaction():
     for level in EVASION_LEVELS:
         if not level.is_behavioral:
             assert not (level.camoufox_options or {}).get("humanize")
+# --------------------------------------------------------------------------
+# Outbound funnel: promotional-banner discovery, CTR simulation and telemetry.
+#
+# The spec item asked for dynamic scope management driven by DOM-extracted URLs.
+# The engine reconciles that with its core invariant -- out-of-scope hosts are
+# refused unless the operator declared them -- so discovery is dynamic but
+# authorization stays operator-declared. These tests pin both halves.
+# --------------------------------------------------------------------------
+
+from urllib.parse import urlparse  # noqa: E402
+
+from camoufox.audit import (  # noqa: E402
+    BannerCandidate,
+    CampaignEvent,
+    discover_banner_candidates,
+    is_ad_syndication_url,
+    parse_rate_pct,
+    plan_outbound_visit,
+)
+from camoufox.audit.behavior import BehaviorModel as _BM, campaign_dwell  # noqa: E402
+from camoufox.audit.report import write_csv  # noqa: E402
+
+
+def test_parse_rate_pct_accepts_the_shapes_an_operator_writes():
+    assert parse_rate_pct("2.5") == pytest.approx(2.5)
+    assert parse_rate_pct("2.5%") == pytest.approx(2.5)
+    assert parse_rate_pct("0.05") == pytest.approx(0.05)
+    assert parse_rate_pct(3) == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "two percent", "abc%", None, "1,5"])
+def test_parse_rate_pct_rejects_junk(bad):
+    with pytest.raises(ValueError):
+        parse_rate_pct(bad)
+
+
+def test_scope_gate_refuses_undeclared_partner_even_though_discovery_found_it():
+    """
+    The safety invariant: a discovered host is not an authorized host.
+
+    This is the reconciliation of the "extend scope from DOM URLs" spec item --
+    the URL is *seen*, and reported, but not followed until declared.
+    """
+    scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
+    candidates = discover_banner_candidates(
+        [
+            {"href": "https://shop.example.com/spring-sale", "selector": "a.promo-banner"},
+            {"href": "https://untrusted.example.net/offer", "selector": "a[data-campaign]"},
+        ],
+        page_url="https://shop.example.com/",
+        scope=scope,
+    )
+    by_host = {urlparse(c.url).hostname: c for c in candidates}
+    first_party = by_host["shop.example.com"]
+    third_party = by_host["untrusted.example.net"]
+
+    assert first_party.first_party is True
+    assert first_party.authorized is True
+    # Seen, retained for reporting, and deliberately not followable.
+    assert third_party.first_party is False
+    assert third_party.authorized is False
+    assert third_party.refusal, "a refusal must carry a reason to report"
+
+    # The selection step must only ever consider authorized candidates.
+    picked = plan_outbound_visit("100", candidates, random.Random(0))
+    assert picked.campaign_url is not None
+    assert urlparse(picked.campaign_url).hostname == "shop.example.com"
+
+
+def test_a_declared_partner_becomes_followable_without_widening_the_scope():
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    candidates = discover_banner_candidates(
+        [{"href": "https://partner.example.net/landing"}],
+        page_url="https://shop.example.com/",
+        scope=scope,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].authorized is True
+    assert candidates[0].first_party is False
+    # Declaring a partner must not make the *target* scope broader.
+    assert scope.permits_url("https://partner.example.net/landing") is False
+    assert scope.permits_url("https://shop.example.com/") is True
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://shop.example.com/offer", False),
+        ("https://criteo.com/click?x=1", True),
+        ("https://criteo.net/x", True),
+        ("https://adservice.google.com/pagead/aclk", True),
+        ("https://partner.example.net/landing", False),
+        ("https://notcriteo.example.com/x", False),
+        ("https://mycriteo.com.example.net/x", False),
+    ],
+)
+def test_ad_syndication_wrappers_are_filtered_and_lookalikes_are_not(url, expected):
+    assert is_ad_syndication_url(url) is expected
+
+
+def test_outbound_scope_round_trips_and_remembers_what_was_admitted():
+    original = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    assert original.check_unattended("https://partner.example.net/landing") is True
+
+    restored = TargetScope.from_dict(original.to_dict())
+    assert restored.outbound_hosts == original.outbound_hosts
+    assert restored.session_outbound == original.session_outbound
+    assert restored.check_unattended("https://partner.example.net/x") is True
+    # A host that was never declared is still refused after the round trip.
+    assert restored.check_unattended("https://other.example.net/x") is False
+
+
+def test_outbound_gate_refuses_ip_literals_and_lookalike_partner_hosts():
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    # The metadata endpoint is a literal, and a lookalike must not match by suffix.
+    assert scope.check_unattended("http://169.254.169.254/latest/meta-data") is False
+    assert scope.check_unattended("https://evil-partner.example.net/x") is False
+    assert scope.check_unattended("javascript:alert(1)") is False
+
+
+def test_an_unacknowledged_scope_permits_no_outbound_destination():
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=False,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    assert scope.check_unattended("https://partner.example.net/x") is False
+
+
+def test_discovery_drops_non_http_and_same_document_fragments():
+    candidates = discover_banner_candidates(
+        [
+            {"href": "javascript:alert(1)"},
+            {"href": "mailto:hi@example.com"},
+            {"href": "https://shop.example.com/#section"},
+            {"href": "https://shop.example.com/real"},
+        ],
+        page_url="https://shop.example.com/",
+    )
+    assert [c.url for c in candidates] == ["https://shop.example.com/real"]
+
+
+def test_discovery_deduplicates_by_url():
+    candidates = discover_banner_candidates(
+        [
+            {"href": "https://shop.example.com/offer"},
+            {"href": "https://shop.example.com/offer"},
+            {"href": "https://shop.example.com/offer#a"},
+        ],
+        page_url="https://shop.example.com/",
+    )
+    assert len(candidates) == 1
+
+
+# --------------------------------------------------------------------------
+# Iframe banner discovery
+# --------------------------------------------------------------------------
+
+
+def test_include_iframes_discovers_banners_inside_a_child_frame():
+    """
+    An ad iframe's banner is a candidate when frames are inspected.
+
+    A campaign served from an iframe is the common case, so a main-frame-only
+    scan reports "no banner" on a page that is visibly showing one. The frame
+    ordinal is carried on the candidate so the click can be aimed back at it.
+    """
+    anchors = [
+        {"href": "https://shop.example.com/main-offer", "frame_index": 0},
+        {"href": "https://partner.example.net/framed", "frame_index": 1},
+    ]
+    candidates = discover_banner_candidates(
+        anchors, page_url="https://shop.example.com/", include_iframes=True
+    )
+    urls = {c.url for c in candidates}
+    assert "https://shop.example.com/main-offer" in urls
+    assert "https://partner.example.net/framed" in urls
+
+    framed = next(c for c in candidates if c.url.endswith("/framed"))
+    assert framed.frame_index == 1
+    assert framed.from_iframe is True
+    main = next(c for c in candidates if c.url.endswith("/main-offer"))
+    assert main.frame_index == 0
+    assert main.from_iframe is False
+
+
+def test_include_iframes_false_excludes_child_frame_banners():
+    """
+    Turning the option off restricts discovery to the main document.
+
+    The framed anchor must vanish entirely -- not merely be refused -- so that
+    excluding frames cannot leave the frame's destination counted anywhere in the
+    report.
+    """
+    anchors = [
+        {"href": "https://shop.example.com/main-offer", "frame_index": 0},
+        {"href": "https://partner.example.net/framed", "frame_index": 1},
+    ]
+    candidates = discover_banner_candidates(
+        anchors, page_url="https://shop.example.com/", include_iframes=False
+    )
+    assert [c.url for c in candidates] == ["https://shop.example.com/main-offer"]
+
+
+def test_iframe_banners_still_pass_the_outbound_gate():
+    """
+    A frame-derived destination is authorized exactly like a main-document one.
+
+    A frame is untrusted content, so coming out of an iframe must not elevate a
+    destination. An undeclared partner host inside a frame is discovered (so it
+    can be reported) and left unauthorized (so it cannot be followed).
+    """
+    scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
+    candidates = discover_banner_candidates(
+        [{"href": "https://partner.example.net/framed", "frame_index": 1}],
+        page_url="https://shop.example.com/",
+        scope=scope,
+        include_iframes=True,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].from_iframe is True
+    assert candidates[0].authorized is False
+    assert candidates[0].refusal
+
+    # And with no candidate authorized, the roll can never produce a destination.
+    assert plan_outbound_visit("100", candidates, random.Random(0)).triggered is False
+
+
+def test_a_declared_partner_inside_a_frame_is_authorized():
+    """The declaration, not the frame, is what admits an iframe destination."""
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    candidates = discover_banner_candidates(
+        [{"href": "https://partner.example.net/framed", "frame_index": 2}],
+        page_url="https://shop.example.com/",
+        scope=scope,
+        include_iframes=True,
+    )
+    assert candidates[0].authorized is True
+    assert candidates[0].frame_index == 2
+
+
+def test_the_selected_plan_carries_the_frame_of_the_chosen_banner():
+    """
+    The frame ordinal survives selection.
+
+    The click resolves the frame from the plan, so if selection dropped the
+    ordinal an iframe banner would be pressed in the main document -- or not at
+    all. Pinned here because the loss would be silent.
+    """
+    candidates = [
+        BannerCandidate(url="https://shop.example.com/a", authorized=True, frame_index=0),
+        BannerCandidate(url="https://shop.example.com/b", authorized=True, frame_index=3),
+    ]
+    plans = [plan_outbound_visit("100", candidates, random.Random(s)) for s in range(40)]
+    assert all(p.triggered for p in plans)
+    for plan in plans:
+        chosen = next(c for c in candidates if c.url == plan.campaign_url)
+        assert plan.frame_index == chosen.frame_index
+
+
+def test_resolving_a_frame_ordinal_maps_to_the_right_child_frame():
+    """
+    Ordinal 0 is the page; ordinal N is the Nth child frame.
+
+    `page.frames` holds the main frame first, so a naive enumerate-from-zero would
+    make child frame 1 alias the main document and mis-aim the cursor. The
+    ordinals are asserted against a stand-in page here rather than trusted.
+    """
+    url = "http://127.0.0.1:1/"
+    runner = AuditRunner(_config(url))
+
+    class _StubFrame:
+        def __init__(self, name):
+            self.name = name
+
+    main = _StubFrame("main")
+    child_a = _StubFrame("a")
+    child_b = _StubFrame("b")
+
+    class _StubPage:
+        frames = [main, child_a, child_b]
+        main_frame = main
+
+    page = _StubPage()
+    assert runner._frame_for(page, 0) is page
+    assert runner._frame_for(page, 1) is child_a
+    assert runner._frame_for(page, 2) is child_b
+    # An ordinal past the end must not silently fall back to the main document.
+    assert runner._frame_for(page, 9) is None
+
+
+def test_child_frames_follow_the_list_order_even_if_the_main_frame_is_not_first():
+    """
+    The main frame is excluded by identity, not by trusting position zero.
+
+    `page.frames` ordering is an implementation contract, so the guard matters:
+    if the main frame were ever listed later, counting from zero would have made
+    child frame 1 alias the document and aimed the cursor at the wrong geometry.
+    """
+    url = "http://127.0.0.1:1/"
+    runner = AuditRunner(_config(url))
+
+    class _StubFrame:
+        def __init__(self, name):
+            self.name = name
+
+    main = _StubFrame("main")
+    child_a = _StubFrame("a")
+
+    class _StubPage:
+        frames = [child_a, main]
+        main_frame = main
+
+    assert runner._child_frames(_StubPage()) == [child_a]
+    assert runner._frame_for(_StubPage(), 1) is child_a
+
+
+def test_a_page_with_no_identifiable_main_frame_yields_no_child_frames():
+    """
+    Without a main_frame to exclude, no frame is numbered.
+
+    The alternative -- numbering every listed frame -- could point ordinal 1 at
+    the document itself and press the wrong element. Losing frames is recoverable
+    and visible; mis-numbering them is neither.
+    """
+    url = "http://127.0.0.1:1/"
+    runner = AuditRunner(_config(url))
+
+    class _StubPage:
+        frames = [object(), object()]
+        main_frame = None
+
+    assert runner._child_frames(_StubPage()) == []
+    assert runner._frame_for(_StubPage(), 1) is None
+
+
+def test_include_iframes_defaults_to_true():
+    """Frames are inspected by default; the opt-out is explicit."""
+    cfg = AuditConfig(target_url="https://shop.example.com/", scope=TargetScope.from_urls(
+        ["https://shop.example.com/"], acknowledged=True
+    ))
+    assert cfg.include_iframes is True
+    assert cfg.to_dict()["include_iframes"] is True
+
+
+def test_the_runner_reads_child_frames_only_when_enabled():
+    """
+    The runner reads frames through their own `evaluate`, gated on the flag.
+
+    `page.locator()` is `mainFrame().locator()` in Playwright, so a child frame's
+    anchors are invisible to any main-frame query -- the runner has to ask each
+    frame directly. The stand-in below records which frames were read, which is
+    the behaviour the flag controls.
+    """
+    url = "http://127.0.0.1:1/"
+    main_anchors = [{"href": "https://shop.example.com/main-offer"}]
+    frame_anchors = [{"href": "https://shop.example.com/framed"}]
+
+    class _StubFrame:
+        def __init__(self, anchors, name):
+            self._anchors = anchors
+            self.name = name
+            self.reads = 0
+
+        async def evaluate(self, _script, *args):
+            self.reads += 1
+            return self._anchors
+
+    child = _StubFrame(frame_anchors, "child")
+
+    class _StubPage:
+        def __init__(self):
+            self.main_frame = _StubFrame(main_anchors, "main")
+            self.frames = [self.main_frame, child]
+
+        async def evaluate(self, _script, *args):
+            return self.main_frame._anchors
+
+    async def collect(include_iframes):
+        runner = AuditRunner(_config(url, include_iframes=include_iframes))
+        page = _StubPage()
+        return await runner._collect_banner_anchors(page), page
+
+    anchors_on, _ = asyncio.run(collect(True))
+    urls = {a["href"] for a in anchors_on}
+    assert urls == {"https://shop.example.com/main-offer", "https://shop.example.com/framed"}
+    framed = next(a for a in anchors_on if a["href"].endswith("/framed"))
+    assert framed["frame_index"] == 1, "a child frame is ordinal 1, never 0"
+    main = next(a for a in anchors_on if a["href"].endswith("/main-offer"))
+    assert main["frame_index"] == 0
+
+    anchors_off, _ = asyncio.run(collect(False))
+    assert {a["href"] for a in anchors_off} == {"https://shop.example.com/main-offer"}
+
+
+def test_an_unreadable_frame_does_not_hide_the_others():
+    """
+    One frame that throws must not fail the whole scan.
+
+    Frames detach, navigate mid-read, and tear down at cross-origin boundaries.
+    Losing a readable frame's banners because a sibling raised would turn a
+    routine race into a false "no banner found".
+    """
+    url = "http://127.0.0.1:1/"
+
+    class _BadFrame:
+        name = "bad"
+
+        async def evaluate(self, _script, *args):
+            raise RuntimeError("frame detached")
+
+    class _GoodFrame:
+        name = "good"
+
+        async def evaluate(self, _script, *args):
+            return [{"href": "https://shop.example.com/good"}]
+
+    class _StubPage:
+        def __init__(self):
+            self.main_frame = _BadFrame()
+            self.frames = [self.main_frame, _BadFrame(), _GoodFrame()]
+
+        async def evaluate(self, _script, *args):
+            return []
+
+    runner = AuditRunner(_config(url))
+
+    async def collect():
+        return await runner._collect_banner_anchors(_StubPage())
+
+    anchors = asyncio.run(collect())
+    assert [a["href"] for a in anchors] == ["https://shop.example.com/good"]
+    assert anchors[0]["frame_index"] == 2
+
+
+def test_observed_ctr_tracks_the_configured_rate():
+    """
+    The simulated CTR must be a random draw at roughly the set rate, not a
+    fixed count and not a per-visitor deterministic pattern.
+    """
+    candidates = [
+        BannerCandidate(url="https://shop.example.com/offer", first_party=True, authorized=True)
+    ]
+    rate = 2.5
+    n = 6000
+    rng = random.Random(1234)
+    clicks = sum(1 for _ in range(n) if plan_outbound_visit(rate, candidates, rng).triggered)
+    observed = 100.0 * clicks / n
+    assert 2.0 < observed < 3.0, f"observed {observed:.2f}% for a {rate}% rate"
+
+
+def test_a_zero_rate_never_clicks():
+    candidates = [BannerCandidate(url="https://x.example.com/o", authorized=True)]
+    for rate in ("0", "0.0"):
+        for seed in range(30):
+            assert plan_outbound_visit(rate, candidates, random.Random(seed)).triggered is False
+
+
+def test_no_candidates_never_clicks():
+    plan = plan_outbound_visit("100", [], random.Random(0))
+    assert plan.triggered is False
+
+
+def test_campaign_dwell_is_right_skewed_within_bounds():
+    model = _BM()
+    rng = random.Random(7)
+    draws = [campaign_dwell(rng, model) for _ in range(2000)]
+    assert all(model.campaign_min_s <= d <= model.campaign_max_s for d in draws)
+    assert min(draws) < model.campaign_median_s < max(draws)
+    # Log-normal: the mean sits above the median.
+    assert sum(draws) / len(draws) > model.campaign_median_s
+
+
+def test_engaged_excludes_a_landing_that_refused_to_serve():
+    blocked = CampaignEvent(
+        campaign_url="https://partner.example.net/x",
+        landed=True,
+        landing_status=403,
+        landing_verdict="blocked",
+        skipped_reason="landing page was blocked",
+    )
+    served = CampaignEvent(
+        campaign_url="https://shop.example.com/offer",
+        landed=True,
+        landing_status=200,
+        landing_verdict="allowed",
+        dwell_s=25.0,
+    )
+    assert blocked.engaged is False
+    assert served.engaged is True
+
+
+def test_campaign_event_round_trips_through_to_dict():
+    event = CampaignEvent(
+        campaign_url="https://shop.example.com/offer",
+        first_party=True,
+        selector_hint="a.promo-banner",
+        landed=True,
+        landing_status=200,
+        landing_verdict="allowed",
+        dwell_s=21.33333,
+        glances=1,
+        scroll_bursts=3,
+    )
+    payload = event.to_dict()
+    assert payload["campaign_url"] == "https://shop.example.com/offer"
+    assert payload["dwell_s"] == pytest.approx(21.333)
+    assert payload["engaged"] is True
+    assert payload["scroll_bursts"] == 3
+
+
+def test_funnel_config_validates_a_bad_rate():
+    scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
+
+    # With the funnel on, a rate that cannot be read is refused at construction
+    # rather than silently coerced -- an unreadable rate would decide real
+    # traffic, so failing fast is the safe default.
+    with pytest.raises(ValueError):
+        AuditConfig(
+            target_url="https://shop.example.com/",
+            scope=scope,
+            enable_outbound_funnel=True,
+            outbound_campaign_rate_pct="lots",
+        )
+
+    # `validate` still catches a rate that was set after construction, with a
+    # message an operator can act on.
+    mutated = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=True,
+        outbound_campaign_rate_pct="2.5",
+    )
+    mutated.outbound_campaign_rate_pct = "lots"
+    assert any("outbound_campaign_rate_pct" in p for p in mutated.validate())
+
+    zero = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=True,
+        outbound_campaign_rate_pct="0",
+    )
+    assert any("no visitor will click" in p for p in zero.validate())
+
+    # With the funnel off the rate decides no traffic, so an unreadable value is
+    # tolerated and not reported -- the run is still well-defined.
+    off = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=False,
+        outbound_campaign_rate_pct="lots",
+    )
+    assert off.validate() == []
+
+
+def test_funnel_config_round_trips_through_to_dict():
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    cfg = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=True,
+        outbound_campaign_rate_pct="4.5",
+    )
+    payload = cfg.to_dict()
+    assert payload["enable_outbound_funnel"] is True
+    # Normalized to a float by construction, so the serialized form is canonical.
+    assert payload["outbound_campaign_rate_pct"] == pytest.approx(4.5)
+    assert payload["scope"]["outbound_hosts"] == ["partner.example.net"]
+
+
+def _funnel_report(events, *, outbound_hosts=()):
+    """Assemble an AuditReport carrying the given campaign events."""
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=list(outbound_hosts),
+    )
+    cfg = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=True,
+        outbound_campaign_rate_pct="2.5",
+        levels=[5],
+        visitor_count=len(events),
+    )
+    report = AuditReport(config=cfg)
+    lr = LevelResult(level=level_by_id(5))
+    for index, event in enumerate(events):
+        lr.visits.append(
+            VisitResult(
+                visitor_index=index,
+                level_id=5,
+                started_at=0.0,
+                finished_at=1.0,
+                verdict=Verdict.ALLOWED,
+                campaign=event,
+            )
+        )
+    lr.finished_at = 1.0
+    report.levels.append(lr)
+    report.finished_at = 1.0
+    return report
+
+
+def test_funnel_summary_counts_clicks_landings_and_engagement():
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=30.0,
+            ),
+            CampaignEvent(
+                campaign_url="https://partner.example.net/x",
+                first_party=False,
+                landed=True,
+                landing_status=403,
+                landing_verdict="blocked",
+                skipped_reason="landing page was blocked",
+            ),
+            CampaignEvent(
+                campaign_url="https://partner.example.net/y",
+                first_party=False,
+                skipped_reason="outbound destination was not authorized by scope",
+                refused_by_scope=True,
+            ),
+        ],
+        outbound_hosts=["partner.example.net"],
+    )
+    funnel = report.funnel_summary()
+    assert funnel["clicks"] == 3
+    assert funnel["landed"] == 2
+    assert funnel["engaged"] == 1
+    assert funnel["refused"] == 1
+    assert funnel["skipped_by_scope"] == 1
+    assert funnel["first_party_clicks"] == 1
+    assert funnel["partner_clicks"] == 2
+    # Dwell only reflects the destination that actually served the offer.
+    assert funnel["dwell_p50_s"] == pytest.approx(30.0)
+    assert funnel["dwell_min_s"] == pytest.approx(30.0)
+
+
+def test_a_landing_reason_mentioning_scope_is_not_tallied_as_a_refusal():
+    """
+    The refusal category is a flag, not a substring of the reason text.
+
+    `skipped_reason` is prose meant for an operator. Classifying by searching it
+    for "scope" would mis-file an ordinary unreachable landing whose message
+    happens to use the word -- the kind of bug that stays invisible until a
+    wording change silently moves a number in the report.
+    """
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://partner.example.net/x",
+                first_party=False,
+                skipped_reason="navigation failed: the landing was outside its scope",
+            )
+        ],
+        outbound_hosts=["partner.example.net"],
+    )
+    funnel = report.funnel_summary()
+    assert funnel["skipped_by_scope"] == 0
+    assert funnel["unreachable"] == 1
+
+
+def test_funnel_findings_name_the_rate_and_the_engagement():
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=42.0,
+            )
+        ]
+    )
+    joined = "\n".join(build_findings(report))
+    assert "2.5%" in joined
+    assert "42" in joined
+
+
+def test_funnel_findings_warn_when_no_partner_hosts_are_declared():
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=20.0,
+            )
+        ]
+    )
+    joined = "\n".join(build_findings(report))
+    assert "no partner destinations were declared" in joined.lower()
+
+
+def test_funnel_findings_say_so_when_nothing_clicked():
+    # A visit that completed but produced no click-through: the funnel ran and
+    # found nothing, which is a conclusion rather than an empty report.
+    report = _funnel_report([None])
+    joined = "\n".join(build_findings(report))
+    assert "no visitor clicked a promotional banner" in joined
+
+
+def test_report_renders_the_funnel_section_in_text_and_html():
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=33.0,
+                scroll_bursts=4,
+            )
+        ]
+    )
+    text = render_text(report)
+    assert "OUTBOUND FUNNEL" in text
+    assert "https://shop.example.com/offer" in text
+
+    html = render_html(report)
+    assert "Outbound funnel" in html
+    assert "https://shop.example.com/offer" in html
+
+
+def test_csv_exports_campaign_columns(tmp_path):
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=19.5,
+            )
+        ]
+    )
+    out = tmp_path / "audit.csv"
+    write_csv(report, str(out))
+    body = out.read_text(encoding="utf-8")
+    assert "campaign_url" in body.splitlines()[0]
+    assert "campaign_dwell_s" in body.splitlines()[0]
+    assert "https://shop.example.com/offer" in body
+
+
+def test_the_report_marks_a_banner_that_was_served_from_an_iframe(tmp_path):
+    """
+    A frame-served campaign is visible in the aggregate and the CSV.
+
+    "The offer was in an iframe" is a finding about how the site serves its
+    campaign, and the explanation for a main-frame-only scan reporting no banner.
+    It is carried through the funnel summary and the machine-readable export.
+    """
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/framed",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=11.0,
+                frame_index=2,
+            )
+        ]
+    )
+    funnel = report.funnel_summary()
+    assert funnel["iframe_clicks"] == 1
+    assert "from iframes" in render_text(report)
+
+    out = tmp_path / "audit.csv"
+    write_csv(report, str(out))
+    body = out.read_text(encoding="utf-8")
+    assert "campaign_frame_index" in body.splitlines()[0]
+
+
+def test_a_main_document_click_is_not_counted_as_an_iframe_click():
+    report = _funnel_report(
+        [
+            CampaignEvent(
+                campaign_url="https://shop.example.com/offer",
+                first_party=True,
+                landed=True,
+                landing_status=200,
+                landing_verdict="allowed",
+                dwell_s=10.0,
+                frame_index=0,
+            )
+        ]
+    )
+    assert report.funnel_summary()["iframe_clicks"] == 0
+    assert "from iframes" not in render_text(report)
+
+
+def test_the_funnel_section_states_the_scan_scope():
+    """
+    The report says whether frames were inspected.
+
+    "No promotional banner found" means something different when frames were
+    skipped, and the operator should not have to remember a config flag to read
+    the finding.
+    """
+    framed = _funnel_report([None])
+    assert "main document + iframes" in render_text(framed)
+
+    scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
+    cfg = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        enable_outbound_funnel=True,
+        include_iframes=False,
+    )
+    report = AuditReport(config=cfg)
+    text = render_text(report)
+    assert "main document only" in text
+    assert "main document + iframes" not in text
+
+
+def test_a_funnel_off_report_omits_the_section():
+    scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
+    cfg = AuditConfig(target_url="https://shop.example.com/", scope=scope)
+    report = AuditReport(config=cfg)
+    assert report.funnel_summary()["enabled"] is False
+    assert "OUTBOUND FUNNEL" not in render_text(report)
+    assert all("funnel" not in f.lower() for f in build_findings(report))
+
+
+def test_the_funnel_gate_holds_on_non_behavioral_rungs():
+    """
+    Only a rung that claims behavior may click a banner.
+
+    A click-through is an interaction. On a rung that does not claim behavior,
+    emitting one would make that rung's verdict the product of an interaction it
+    never claimed -- the unattributable-verdict failure the ladder is built to
+    prevent.
+    """
+    url = "http://127.0.0.1:1/"
+    config = _config(url, enable_outbound_funnel=True, levels=[0, 2])
+    runner = AuditRunner(config)
+    assert runner._funnel_applies(level_by_id(0)) is False
+    assert runner._funnel_applies(level_by_id(2)) is False
+    assert runner._funnel_applies(level_by_id(5)) is True
+
+
+def test_the_funnel_is_off_by_default_so_no_rung_clicks():
+    url = "http://127.0.0.1:1/"
+    config = _config(url, levels=[5])
+    runner = AuditRunner(config)
+    assert config.enable_outbound_funnel is False
+    assert runner._funnel_applies(level_by_id(5)) is False
+
+
+def test_the_walk_selects_only_a_banner_the_scope_authorized():
+    """
+    The runner reports a refused banner and never selects it.
+
+    A stub page reports one authorized first-party banner and one undeclared
+    third-party banner, with the interaction rate pinned at 100% so the roll
+    always fires. The walk is asserted to have chosen the first-party
+    destination, and to have recorded the refused one -- and because the stub
+    page cannot be clicked, the walk ends without a landing, which is the honest
+    outcome rather than a claimed click-through.
+    """
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        outbound_urls=["https://partner.example.net/"],
+    )
+    config = AuditConfig(
+        target_url="https://shop.example.com/",
+        scope=scope,
+        levels=[5],
+        visitor_count=1,
+        enable_outbound_funnel=True,
+        outbound_campaign_rate_pct="100",
+        seed=1,
+    )
+    runner = AuditRunner(config)
+
+    class StubPage:
+        """A page that reports banners; it cannot be clicked or navigated."""
+
+        async def evaluate(self, _script, *args):
+            return [
+                {"href": "https://shop.example.com/offer", "selector": "a.promo-banner"},
+                {"href": "https://undeclared.example.net/x", "selector": "a[data-campaign]"},
+            ]
+
+    async def walk():
+        result = VisitResult(visitor_index=0, level_id=5, started_at=0.0)
+        await runner._walk_outbound_funnel(
+            None,
+            StubPage(),
+            None,
+            level_by_id(5),
+            None,
+            "https://shop.example.com/",
+            result,
+        )
+        return result
+
+    result = asyncio.run(walk())
+    evidence = " ".join(result.evidence)
+
+    assert "undeclared.example.net" in evidence, "the refused banner must be reported"
+    assert result.campaign is not None, "the 100% roll must select an authorized banner"
+    assert urlparse(result.campaign.campaign_url).hostname == "shop.example.com"
+    assert "undeclared.example.net" not in result.campaign.campaign_url

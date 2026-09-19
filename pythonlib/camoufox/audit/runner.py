@@ -34,13 +34,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-from .behavior import BehaviorModel, Cursor, spend_dwell
-from .config import AuditConfig, AuditReport, LevelResult, VisitResult
+from .behavior import BehaviorModel, Cursor, campaign_dwell, spend_dwell
+from .config import AuditConfig, AuditReport, CampaignEvent, LevelResult, VisitResult
 from .detection import VENDOR_SIGNATURES, Verdict, classify_response
 from .evasion import EvasionLevel
-from .journey import ArrivalSource, build_arrival_referer, plan_visit
+from .journey import (
+    ArrivalSource,
+    build_arrival_referer,
+    discover_banner_candidates,
+    plan_outbound_visit,
+    plan_visit,
+)
 from .schedule import build_schedule
-from .scope import ScopeViolation
+from .scope import ScopeViolation, TargetScope
 
 __all__ = ["AuditRunner", "SafetyStop"]
 
@@ -78,6 +84,46 @@ def _merge_navigation_headers(
             merged[name] = value
             lowered[name.lower()] = name
     return merged
+
+
+class _OpenResult:
+    """
+    The outcome of trying to follow a promotional banner.
+
+    A small carrier rather than a tuple so the failure modes stay distinguishable:
+    `loaded` is False when nothing was reached, `status` is None when the
+    destination loaded but its response was not observed (a click that landed in a
+    tab whose first response the listener missed), and `page` is the page that
+    needs closing.
+    """
+
+    __slots__ = ("page", "status", "headers", "body", "loaded")
+
+    def __init__(self) -> None:
+        self.page: Optional[Any] = None
+        self.status: Optional[int] = None
+        self.headers: Dict[str, str] = {}
+        self.body: str = ""
+        self.loaded: bool = False
+
+
+async def _capture_response(
+    handler: "_OpenResult", page: Any, response: Any
+) -> None:
+    """Fill `handler` from a landing page and, when available, its response."""
+    handler.page = page
+    handler.loaded = True
+    if response is None:
+        return
+    handler.status = getattr(response, "status", None)
+    try:
+        handler.headers = dict(response.headers or {})
+    except Exception:
+        handler.headers = {}
+    try:
+        handler.body = (await response.text())[:200_000]
+    except Exception:
+        handler.body = ""
 
 
 class _Limiter:
@@ -145,6 +191,8 @@ class AuditRunner:
         self._persistence_noted = False
         self._single_level_noted = False
         self._browser_reuse_noted = False
+        self._funnel_gate_noted = False
+        self._funnel_scope_noted = False
         self._rotator = None
         self._behavior = BehaviorModel()
         #: The level-scoped browser when `reuse_browser` is on, or None when each
@@ -682,6 +730,20 @@ class AuditRunner:
                 if plan.will_type and page_index == 0:
                     await self._maybe_type(page, cursor, result, stage_deadline)
 
+                # Outbound funnel: after the visitor has read the arrival page,
+                # which is when a person notices a promotional banner. Runs only
+                # on a behavioral rung (see `_funnel_applies`), and only on the
+                # first page. A click-through is a *departure*: the visitor left
+                # the page under audit for the campaign destination, so the
+                # journey ends here rather than picking its next hop from links
+                # the destination happens to have.
+                if page_index == 0 and self._funnel_applies(level):
+                    self._note_funnel_scope()
+                    if await self._walk_outbound_funnel(
+                        context, page, cursor, level, plan, url, result
+                    ):
+                        return
+
                 # Then the rest of the page's reading time, which is where the
                 # dwell actually lands.
                 remaining = self._page_dwell(plan, page_index)
@@ -763,6 +825,41 @@ class AuditRunner:
         return anchors.findIndex(a => a.href === url);
     }"""
 
+    #: Scrolls a promotional banner into view and reports the ones present.
+    #:
+    #: Reads the DOM because the point of the funnel audit is to discover the
+    #: campaign destinations dynamically -- no hand-maintained domain list. The
+    #: selector set is deliberately narrow: a banner is a promotional anchor, and
+    #: the whole page's nav/footer links are not campaign destinations. `href` is
+    #: the *resolved* property (`a.href`), not the attribute, so a relative link
+    #: becomes the absolute URL the audit would actually contact.
+    #:
+    #: Visibility is checked so a hidden tracking pixel wrapped in an anchor does
+    #: not count as a banner a person could click.
+    _DISCOVER_BANNERS_JS = """() => {
+        const selectors = ['a.promo-banner', 'div.hero-promo a',
+                           'a[data-campaign]', 'a[data-banner]',
+                           'a[class*="promo" i]', 'a[class*="banner" i]'];
+        const seen = new Set();
+        const out = [];
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                const href = el.href;
+                if (!href || seen.has(href)) continue;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (rect.width < 1 || rect.height < 1) continue;
+                if (style.visibility === 'hidden' || style.display === 'none') continue;
+                seen.add(href);
+                const label = (el.getAttribute('data-campaign') ||
+                               el.textContent || '').trim().slice(0, 120);
+                out.push({href: href, selector: sel, text: label});
+                if (out.length >= 60) return out;
+            }
+        }
+        return out;
+    }"""
+
     async def _follow_link(self, page, cursor: Cursor, next_url: str):
         """
         Navigate by clicking the link a reader would click.
@@ -814,6 +911,452 @@ class AuditRunner:
         scale = 1.0 if total <= 0 or total <= budget else budget / total
         index = min(page_index, len(slices) - 1)
         return max(0.0, slices[index] * scale)
+
+    # -- outbound funnel ---------------------------------------------------
+
+    def _funnel_applies(self, level: EvasionLevel) -> bool:
+        """
+        Whether this rung may click a promotional banner.
+
+        Gated on the two conditions the feature is defined by: the operator turned
+        it on, and the rung is behavioral. A click-through is human behavior, and
+        a rung that does not claim behavior must not silently exhibit it --
+        otherwise L2's verdict would be the product of an interaction L2 never
+        claimed, which is exactly the unattributable-verdict failure the ladder is
+        built to prevent.
+        """
+        return bool(self.config.enable_outbound_funnel) and level.is_behavioral
+
+    def _note_funnel_skipped(self, level: EvasionLevel) -> None:
+        if self._funnel_gate_noted:
+            return
+        self._funnel_gate_noted = True
+        self._progress(
+            event="notice",
+            message=(
+                f"Outbound funnel auditing is on, but {level.name} does not claim "
+                f"behavior, so no banner is clicked at this rung. The funnel runs on "
+                f"the behavioral rungs (L5/L6); add a behavioral rung to measure it."
+            ),
+        )
+
+    def _note_funnel_scope(self) -> None:
+        if self._funnel_scope_noted:
+            return
+        self._funnel_scope_noted = True
+        scope = self.config.scope
+        if not scope.outbound_hosts:
+            self._progress(
+                event="notice",
+                message=(
+                    "Outbound funnel auditing is on but no partner destinations are "
+                    "declared, so only first-party (in-scope) banners will be "
+                    "followed. Declare campaign hosts in the scope's outbound list to "
+                    "follow partner links."
+                ),
+            )
+
+    async def _discover_banners(self, page, page_url: str) -> List[Any]:
+        """
+        Read the page's promotional banners and keep the ones we may follow.
+
+        Discovery is dynamic -- the DOM decides which destinations exist, so there
+        is no hand-maintained campaign list to drift. Authorization is not: a
+        discovered host is followed only when the operator's scope already permits
+        it. A banner the gate refuses is dropped here and the refusal is recorded
+        by the caller, so a third-party or syndicated link shows up in the report
+        rather than being silently invisible.
+
+        With `include_iframes` on, every child frame is read as well. A campaign is
+        routinely served from an ad iframe, so a main-frame-only scan reports "no
+        promotional banner found" on a page that is visibly showing one -- a false
+        negative about the site's funnel, which is the thing being measured. Frames
+        are read through their own `evaluate`, and each anchor carries the *frame
+        ordinal* so the click can be aimed back at the frame it was seen in.
+
+        A frame is untrusted content, so nothing here is more trusted for coming
+        out of one: the anchors go through the same gate as the main document's.
+        """
+        anchors = await self._collect_banner_anchors(page)
+        return discover_banner_candidates(
+            anchors,
+            page_url=page_url,
+            scope=self.config.scope,
+            include_iframes=self.config.include_iframes,
+        )
+
+    async def _collect_banner_anchors(self, page) -> List[Any]:
+        """
+        Read promotional anchors from the main document and, when enabled, frames.
+
+        Returns the raw anchor mappings with a `frame_index` stamped on each, so a
+        downstream refusal can be attributed to the frame it came from. Main-frame
+        anchors are index 0; child frames follow `page.frames` order.
+
+        A frame that cannot be read (cross-origin teardown, a detached frame, a
+        navigation in flight) is skipped rather than failing the scan: one
+        unreadable frame must not hide the banners in the others.
+        """
+        out: List[Any] = []
+        try:
+            raw = await page.evaluate(self._DISCOVER_BANNERS_JS)
+        except Exception:
+            raw = []
+        for anchor in raw if isinstance(raw, list) else []:
+            if isinstance(anchor, dict):
+                entry = dict(anchor)
+                entry.setdefault("frame_index", 0)
+                out.append(entry)
+
+        if not self.config.include_iframes:
+            return out
+
+        # `page.frames` includes the main frame first, so index 0 is the document
+        # already read above. Child ordinals therefore start at 1 -- numbering them
+        # from 0 would collide with the main document and make `_frame_for` resolve
+        # an iframe banner back to the top-level page.
+        for index, frame in enumerate(self._child_frames(page), start=1):
+            try:
+                raw = await frame.evaluate(self._DISCOVER_BANNERS_JS)
+            except Exception:
+                continue
+            for anchor in raw if isinstance(raw, list) else []:
+                if isinstance(anchor, dict):
+                    entry = dict(anchor)
+                    entry["frame_index"] = index
+                    out.append(entry)
+        return out
+
+    @staticmethod
+    def _child_frames(page) -> List[Any]:
+        """
+        The page's child frames, in the order a candidate's ordinal counts them.
+
+        `page.frames` is documented to hold the main frame first, but that ordering
+        is an implementation contract the click depends on, so it is checked here
+        rather than assumed: if the main frame is ever not first, the ordinals would
+        silently point every iframe candidate at the wrong frame. A page whose main
+        frame cannot be identified in the list contributes no child frames -- the
+        scan loses frames it cannot number correctly, which is visible in the
+        report's scan-scope line, rather than mis-numbering them.
+        """
+        frames = list(getattr(page, "frames", []) or [])
+        if not frames:
+            return []
+        main = getattr(page, "main_frame", None)
+        if main is None:
+            # No way to tell which frame is the document; number none of them.
+            return []
+        if frames[0] is main:
+            return frames[1:]
+        return [f for f in frames if f is not main]
+
+    def _frame_for(self, page, frame_index: int) -> Any:
+        """
+        Resolve a candidate's frame ordinal back to the live frame.
+
+        Returns the page itself for index 0 (so callers can use one code path) and
+        None when the ordinal no longer resolves -- a frame can be removed between
+        discovery and the click, and aiming at a stale frame would mis-target the
+        cursor.
+        """
+        if frame_index <= 0:
+            return page
+        frames = self._child_frames(page)
+        if 0 < frame_index <= len(frames):
+            return frames[frame_index - 1]
+        return None
+
+    async def _walk_outbound_funnel(
+        self,
+        context,
+        page,
+        cursor: Cursor,
+        level: EvasionLevel,
+        plan,
+        url: str,
+        result: VisitResult,
+    ) -> bool:
+        """
+        Maybe click a promotional banner and engage with where it lands.
+
+        Runs after the visitor has read the arrival page, because that is when a
+        person notices a banner. Nothing here can leave the authorized scope: the
+        destination was admitted by `_discover_banners` through the outbound gate,
+        and it is re-checked immediately before the navigation so the check that
+        authorized it and the request that uses it cannot drift apart.
+
+        Returns True when the visitor actually departed for the destination, so
+        the caller can end the journey there. A refused or unreachable banner is
+        recorded on the visit and returns False -- the funnel is an observation
+        layered on the posture, not a reason to fail a rung.
+        """
+        candidates = await self._discover_banners(page, url)
+        if not candidates:
+            result.evidence.append("no promotional banner found on the page")
+            return False
+
+        usable = [c for c in candidates if c.authorized]
+        refused = [c for c in candidates if not c.authorized]
+        if refused:
+            # A banner that exists but was not authorized is a finding in its own
+            # right: the page points somewhere the operator did not name. Recorded
+            # so it is visible, never followed.
+            result.evidence.append(
+                f"{len(refused)} banner(s) refused by scope, e.g. {refused[0].url!r}"
+            )
+        if not usable:
+            result.evidence.append(
+                "no promotional banner was authorized to follow; "
+                "declare partner destinations in the outbound scope"
+            )
+            return False
+
+        outbound = plan_outbound_visit(
+            self.config.outbound_campaign_rate_pct, usable, self._rng
+        )
+        if not outbound.triggered or not outbound.campaign_url:
+            result.evidence.append(
+                f"saw {len(usable)} authorized banner(s); CTR roll did not trigger"
+            )
+            return False
+
+        destination = outbound.campaign_url
+        event = CampaignEvent(
+            campaign_url=destination,
+            first_party=outbound.first_party,
+            selector_hint=outbound.selector_hint,
+            frame_index=outbound.frame_index,
+        )
+        result.campaign = event
+
+        # Re-check right before the navigation. The gate is the only thing between
+        # this and an unauthorized request, and re-reading it here means a banner
+        # whose href changed between discovery and click cannot be followed.
+        if not self.config.scope.check_unattended(destination):
+            event.skipped_reason = "outbound destination was not authorized by scope"
+            event.refused_by_scope = True
+            result.evidence.append(f"refused out-of-scope campaign link {destination!r}")
+            return False
+
+        return await self._visit_campaign_destination(
+            context, page, cursor, level, destination, event, result
+        )
+
+    async def _visit_campaign_destination(
+        self,
+        context,
+        page,
+        cursor: Cursor,
+        level: EvasionLevel,
+        destination: str,
+        event: CampaignEvent,
+        result: VisitResult,
+    ) -> bool:
+        """
+        Click the banner, then behave like a reader on the landing page.
+
+        Driven as a click wherever the anchor can be found and pressed -- a typed
+        URL is a different, rarer behavior and arrives with no Referer, which is
+        the stronger tell. The direct navigation is the fallback, and the event
+        records which one happened so the report does not overstate the fidelity.
+
+        Returns True when the visitor reached the destination, so the caller stops
+        the journey there.
+        """
+        opened = None
+        try:
+            # Aim at the frame the banner was discovered in. A heading-less click
+            # would press the top-level document's anchor of the same href -- or
+            # none at all -- when the real banner lives in an iframe.
+            target_frame = self._frame_for(page, event.frame_index)
+            if target_frame is None:
+                event.skipped_reason = "the banner's frame was gone before the click"
+                return False
+            opened = await self._click_or_open_banner(
+                page, cursor, destination, event, target_frame
+            )
+            if opened is None or not opened.loaded:
+                event.skipped_reason = event.skipped_reason or "banner could not be opened"
+                return False
+
+            event.landed = True
+            status, headers, body = opened.status, opened.headers, opened.body
+
+            landing = classify_response(status, headers, body)
+            event.landing_status = status
+            event.landing_verdict = landing.verdict
+            result.pages_loaded += 1
+            # A destination that was challenged or blocked is still a funnel
+            # finding -- the campaign link resolved, but the landing did not serve
+            # the offer. Recorded on the event rather than folded into the visit's
+            # verdict, which belongs to the rung's own posture.
+            if landing.detected:
+                event.skipped_reason = f"landing page was {landing.verdict}"
+                result.evidence.append(
+                    f"campaign landing {destination!r} was {landing.verdict}"
+                )
+                # The visitor did depart -- the destination answered, it just
+                # refused to serve the offer -- so the journey still ends here.
+                return True
+
+            # Spend a plausible amount of attention on the offer, with the pointer
+            # and scroll moving the way they would on any page.
+            target_dwell = campaign_dwell(self._rng, self._behavior)
+            deadline = time.monotonic() + target_dwell
+            event.glances = 0
+            event.scroll_bursts = 0
+            try:
+                await cursor.glance()
+                event.glances += 1
+                bursts = self._rng.randint(
+                    self._behavior.campaign_scroll_bursts_min,
+                    self._behavior.campaign_scroll_bursts_max,
+                )
+                event.scroll_bursts = await cursor.scroll(bursts, deadline=deadline)
+            except Exception:
+                pass
+            remaining = max(0.0, deadline - time.monotonic())
+            event.dwell_s = await spend_dwell(
+                remaining,
+                slice_s=self._behavior.sleep_slice_s,
+                cancelled=self._cancelled,
+            )
+            result.evidence.append(
+                f"campaign click-through to {destination!r} "
+                f"({event.dwell_s:.1f}s, {event.scroll_bursts} scroll bursts)"
+            )
+            return True
+        except Exception as exc:
+            event.skipped_reason = f"{type(exc).__name__}: {exc}"
+            return False
+        finally:
+            # Close the landing tab, not the page under audit. A destination that
+            # opened in a new tab must not be left open, or a long run accumulates
+            # tabs; an in-place navigation leaves `page` as the destination, and
+            # the caller ends the visit there anyway.
+            landing_page = getattr(opened, "page", None)
+            if (
+                opened is not None
+                and landing_page is not None
+                and landing_page is not page
+            ):
+                try:
+                    await landing_page.close()
+                except Exception:
+                    pass
+
+    async def _click_or_open_banner(
+        self, page, cursor: Cursor, destination: str, event: CampaignEvent, frame=None
+    ) -> Optional["_OpenResult"]:
+        """
+        Press the banner's anchor, or navigate to it if it cannot be pressed.
+
+        A promotion usually opens in a new tab (`target="_blank"`), but it may also
+        navigate in place, so both shapes are handled: a response listener is
+        attached to the whole context *before* the click, and afterwards the result
+        is read from whichever page actually loaded the destination. Attaching the
+        listener first is what makes the in-place case observable at all -- a
+        `page.goto` afterwards would issue a second, synthetic request and measure
+        that instead of the click.
+
+        `frame` is where the anchor lives: the page itself for a main-document
+        banner, or a child frame for one served from an iframe. The anchor lookup
+        and the locator both run against that frame, and the pointer is moved using
+        the coordinates Playwright reports -- for a frame element those are already
+        translated into the top-level viewport, so the same cursor motion works in
+        both cases and the mouse stays a page-level input.
+
+        The result records whether a real press happened, because a typed-URL hop
+        is not the same evidence as a click.
+        """
+        if frame is None:
+            frame = page
+        handler = _OpenResult()
+
+        captured: Dict[str, Any] = {}
+
+        def _on_response(response) -> None:
+            if captured.get("response") is not None:
+                return
+            try:
+                if response.url.split("#", 1)[0].rstrip("/") == destination.rstrip("/"):
+                    captured["response"] = response
+            except Exception:
+                pass
+
+        context = page.context
+        context.on("response", _on_response)
+
+        index = -1
+        try:
+            index = await frame.evaluate(self._FIND_ANCHOR_JS, destination)
+        except Exception:
+            index = -1
+
+        try:
+            if index is not None and index >= 0:
+                locator = frame.locator("a[href]").nth(index)
+                before = len(context.pages)
+                if await cursor.click_locator(locator):
+                    event.interaction = "clicked"
+                    # Give the click time to open a tab or navigate in place, and
+                    # for the response listener to see the destination land.
+                    deadline = time.monotonic() + 6.0
+                    while time.monotonic() < deadline:
+                        if captured.get("response") is not None:
+                            break
+                        await asyncio.sleep(0.1)
+
+                    pages = context.pages
+                    # Prefer the page that actually holds the destination; a popup
+                    # is the usual shape, but an in-place navigation leaves `page`
+                    # as the one that navigated.
+                    landing_page = page
+                    if len(pages) > before and pages[-1] is not page:
+                        landing_page = pages[-1]
+                        try:
+                            await landing_page.wait_for_load_state(
+                                "domcontentloaded", timeout=15_000
+                            )
+                        except Exception:
+                            pass
+
+                    response = captured.get("response")
+                    if response is None:
+                        # The click landed but the response was not observed; the
+                        # page still holds the destination, so its content is the
+                        # evidence rather than a second request.
+                        try:
+                            await landing_page.wait_for_load_state(
+                                "domcontentloaded", timeout=15_000
+                            )
+                        except Exception:
+                            pass
+                    await _capture_response(handler, landing_page, response)
+                    return handler
+        except Exception:
+            # Any failure to click falls through to the direct navigation, which
+            # is recorded as such rather than as a click.
+            handler = _OpenResult()
+        finally:
+            try:
+                context.remove_listener("response", _on_response)
+            except Exception:
+                pass
+
+        # Fallback: request the destination directly. Recorded as such, because a
+        # typed-URL hop is not the same evidence as a click.
+        try:
+            response = await page.goto(
+                destination, wait_until="domcontentloaded", timeout=30_000
+            )
+            event.interaction = "navigated"
+            await _capture_response(handler, page, response)
+            return handler
+        except Exception as exc:
+            event.skipped_reason = f"navigation failed: {type(exc).__name__}: {exc}"
+            return None
 
     async def _maybe_type(
         self, page, cursor: Cursor, result: VisitResult, deadline: Optional[float] = None
@@ -1135,6 +1678,13 @@ class AuditRunner:
 
         if self.config.single_level_mode:
             self._note_single_level(self.config.selected_levels()[0])
+
+        if self.config.enable_outbound_funnel:
+            # Say up front when the funnel cannot run, rather than let an operator
+            # read an empty funnel as "no banner worked". A rake of only
+            # non-behavioral rungs cannot exercise the click-through at all.
+            if not any(level.is_behavioral for level in self.config.selected_levels()):
+                self._note_funnel_skipped(self.config.selected_levels()[-1])
 
         selected = self.config.selected_levels()
         for position, level in enumerate(selected):

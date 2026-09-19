@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from .detection import Verdict
 from .evasion import EvasionLevel, level_by_id, levels_up_to
-from .journey import JourneyConfig
+from .journey import JourneyConfig, parse_rate_pct
 from .schedule import ArrivalPattern, ScheduleConfig
 from .scope import TargetScope
 
@@ -33,6 +33,7 @@ __all__ = [
     "SafetyLimits",
     "AuditConfig",
     "VisitResult",
+    "CampaignEvent",
     "LevelResult",
     "AuditReport",
     "SINGLE_LEVEL_VISITORS",
@@ -154,12 +155,56 @@ class AuditConfig:
     #: The rung to run when single_level_mode is True. Ignored otherwise.
     single_level: int = 0
 
+    #: Follow promotional banners to their destination and record the funnel.
+    #:
+    #: Runs on top of the ladder rather than as a rung of its own: a click-through
+    #: is only meaningful on a posture that already claims behavior, so it is
+    #: exercised on the behavioral rungs (L5/L6) and skipped on the rest, which
+    #: keeps a lower rung's verdict about the control it isolates.
+    #:
+    #: Destinations are discovered from the page, but only *followed* when the
+    #: operator authorized them -- first-party links (already in scope) or a host
+    #: declared in `scope.outbound_hosts`. See `TargetScope.authorize_outbound`.
+    enable_outbound_funnel: bool = False
+    #: Fraction of sessions that click a promotional banner, as a percentage.
+    #:
+    #: Stored as a percentage (2.5 means 2.5%) because that is what the operator
+    #: types; the CTR roll compares it against `uniform(0, 100)`. Bounded to
+    #: [0, 30] by `__post_init__`.
+    outbound_campaign_rate_pct: float = 2.5
+    #: Whether banner discovery may look inside child frames.
+    #:
+    #: Many real campaigns are served from an ad iframe, so a main-frame-only
+    #: scan reports "no promotional banner found" on a page that is showing one.
+    #: Defaults to True because that is the shape the tool is meant to measure.
+    #:
+    #: This widens *discovery*, never authorization: a destination found inside a
+    #: frame is still admitted only by `TargetScope`, exactly like one found in the
+    #: main document. A frame is untrusted content by definition, so treating
+    #: frame-extracted URLs as somehow more trusted would be the opposite of safe.
+    include_iframes: bool = True
+
     def __post_init__(self) -> None:
         if self.single_level_mode:
             # Pinned rather than defaulted: a single-rung run exists to be
             # repeated and compared, and a caller-supplied count (or a ladder's
             # per-rung count) would make two such runs incomparable.
             self.visitor_count = SINGLE_LEVEL_VISITORS
+        # Normalize through the same parser the GUI uses, so a value that reached
+        # the engine by a route other than the GUI (a saved profile, a script) is
+        # bounded identically rather than silently widening the run.
+        #
+        # Only enforced when the funnel is on. With it off the rate decides no
+        # traffic, and refusing to build a config over an unused field would block
+        # runs that are perfectly well-defined -- so an off funnel keeps the raw
+        # value and lets `validate` stay silent about it.
+        try:
+            self.outbound_campaign_rate_pct = parse_rate_pct(
+                self.outbound_campaign_rate_pct
+            )
+        except ValueError:
+            if self.enable_outbound_funnel:
+                raise
 
     def selected_levels(self) -> List[EvasionLevel]:
         if self.single_level_mode:
@@ -227,6 +272,24 @@ class AuditConfig:
                 f"visitor_count ({self.visitor_count}) exceeds max_requests "
                 f"({self.limits.max_requests}); the audit would be cut off partway"
             )
+        if self.enable_outbound_funnel:
+            try:
+                rate = parse_rate_pct(self.outbound_campaign_rate_pct)
+            except ValueError:
+                problems.append(
+                    f"outbound_campaign_rate_pct ({self.outbound_campaign_rate_pct!r}) "
+                    f"is not a percentage; give a number like 2.5 for 2.5%"
+                )
+            else:
+                if rate <= 0:
+                    # Not an error, but a run that clicks nothing measures no
+                    # funnel, and the operator asked for one. Say so rather than
+                    # let a zero rate be read as "no banner worked".
+                    problems.append(
+                        "enable_outbound_funnel is on but outbound_campaign_rate_pct "
+                        "is 0, so no visitor will click a banner; set a rate above 0 "
+                        "or turn the funnel off"
+                    )
         return problems
 
     def to_dict(self) -> dict:
@@ -237,6 +300,9 @@ class AuditConfig:
             "levels": self.levels,
             "single_level_mode": self.single_level_mode,
             "single_level": self.single_level,
+            "enable_outbound_funnel": self.enable_outbound_funnel,
+            "outbound_campaign_rate_pct": self.outbound_campaign_rate_pct,
+            "include_iframes": self.include_iframes,
             "visitor_count": self.visitor_count,
             "duration_hours": self.duration_hours,
             "pattern": self.pattern,
@@ -246,6 +312,82 @@ class AuditConfig:
             "cooldown_between_levels_s": self.cooldown_between_levels_s,
             "reuse_browser": self.reuse_browser,
             "headless": self.headless,
+        }
+
+
+@dataclass
+class CampaignEvent:
+    """
+    One visitor's promotional-banner click-through, and what followed it.
+
+    Rides on the `VisitResult` it happened during rather than being a record of
+    its own, because a click-through is only interpretable against the posture
+    that produced it: the same banner can land on a rung that reached the site
+    and a rung that was challenged, and only the pairing says which.
+    """
+
+    #: The destination the banner pointed at.
+    campaign_url: str
+    #: True when the destination was inside the audited site.
+    first_party: bool = True
+    #: The banner's anchor selector, for an operator who wants to find it again.
+    selector_hint: str = ""
+    #: The frame the banner was found in (0 = the main document).
+    #:
+    #: Recorded because "the offer was in an iframe" is a real finding about how
+    #: the site serves its campaign -- and the reason a main-frame-only scan can
+    #: report no banner at all.
+    frame_index: int = 0
+    #: How the click resolved: "clicked" (a real anchor press) or "navigated"
+    #: (the anchor could not be pressed and the URL was requested directly).
+    #:
+    #: The distinction matters -- a typed-URL hop is a different, rarer behavior
+    #: than a click, and reporting one as the other overstates the fidelity.
+    interaction: str = "clicked"
+    #: Whether the destination loaded, and what it answered with.
+    landed: bool = False
+    landing_status: Optional[int] = None
+    landing_verdict: Optional[str] = None
+    #: Seconds actually spent on the destination.
+    dwell_s: float = 0.0
+    glances: int = 0
+    scroll_bursts: int = 0
+    #: Set when the gate refused the destination; the visit is still recorded.
+    skipped_reason: str = ""
+    #: The gate refused this destination because the operator never declared it.
+    #:
+    #: Carried as a flag rather than inferred from `skipped_reason`, because that
+    #: field is prose and counting it by substring would let a landing message
+    #: that merely mentions "scope" be tallied as a refusal.
+    refused_by_scope: bool = False
+
+    @property
+    def engaged(self) -> bool:
+        """
+        True when the visitor actually got to spend time on the offer.
+
+        Distinct from `landed`: a destination that answered 403 landed but served
+        nothing, so counting its zero-second visit as engagement would drag the
+        dwell statistics down and misreport how long visitors read the offer.
+        """
+        return self.landed and not self.skipped_reason
+
+    def to_dict(self) -> dict:
+        return {
+            "campaign_url": self.campaign_url,
+            "first_party": self.first_party,
+            "selector_hint": self.selector_hint,
+            "frame_index": self.frame_index,
+            "interaction": self.interaction,
+            "landed": self.landed,
+            "engaged": self.engaged,
+            "landing_status": self.landing_status,
+            "landing_verdict": self.landing_verdict,
+            "dwell_s": round(self.dwell_s, 3),
+            "glances": self.glances,
+            "scroll_bursts": self.scroll_bursts,
+            "skipped_reason": self.skipped_reason,
+            "refused_by_scope": self.refused_by_scope,
         }
 
 
@@ -271,6 +413,8 @@ class VisitResult:
     evidence: List[str] = field(default_factory=list)
     #: Per-request latencies in seconds.
     latencies: List[float] = field(default_factory=list)
+    #: The funnel click-through that happened during this visit, if any.
+    campaign: Optional[CampaignEvent] = None
 
     @property
     def duration_s(self) -> float:
@@ -309,6 +453,7 @@ class VisitResult:
             "latencies": [round(x, 4) for x in self.latencies],
             "p50_latency": self.p50_latency,
             "p95_latency": self.p95_latency,
+            "campaign": self.campaign.to_dict() if self.campaign else None,
         }
 
 
@@ -374,6 +519,30 @@ class LevelResult:
         all_latencies = [x for v in self.visits for x in v.latencies]
         return _percentile(all_latencies, 95)
 
+    # -- outbound funnel ---------------------------------------------------
+
+    @property
+    def campaign_clicks(self) -> int:
+        """Visitors at this rung who clicked a promotional banner."""
+        return sum(1 for v in self.visits if v.campaign is not None)
+
+    @property
+    def campaign_landings(self) -> int:
+        """Click-throughs whose destination actually loaded."""
+        return sum(1 for v in self.visits if v.campaign and v.campaign.landed)
+
+    @property
+    def campaign_engagements(self) -> int:
+        """Click-throughs that reached a destination and were actually served it."""
+        return sum(1 for v in self.visits if v.campaign and v.campaign.engaged)
+
+    @property
+    def campaign_dwell_s(self) -> List[float]:
+        return [v.campaign.dwell_s for v in self.visits if v.campaign and v.campaign.engaged]
+
+    def campaign_dwell_p50(self) -> Optional[float]:
+        return _percentile(self.campaign_dwell_s, 50)
+
     def to_dict(self) -> dict:
         return {
             "level_id": self.level.id,
@@ -388,6 +557,9 @@ class LevelResult:
             "counts": self.counts(),
             "vendors": self.vendors_seen(),
             "p95_latency": self.p95_latency(),
+            "campaign_clicks": self.campaign_clicks,
+            "campaign_landings": self.campaign_landings,
+            "campaign_dwell_p50": self.campaign_dwell_p50(),
             "aborted": self.aborted,
             "abort_reason": self.abort_reason,
             "duration_s": round(max(0.0, self.finished_at - self.started_at), 2),
@@ -433,6 +605,66 @@ class AuditReport:
         bypassing = [lr for lr in self.levels if lr.visits and lr.bypass_rate >= 0.5]
         return bypassing[-1] if bypassing else None
 
+    # -- outbound funnel ---------------------------------------------------
+
+    @property
+    def funnel_enabled(self) -> bool:
+        return bool(self.config.enable_outbound_funnel)
+
+    def campaign_events(self) -> List[CampaignEvent]:
+        """Every click-through across the run, in visit order."""
+        return [
+            v.campaign
+            for lr in self.levels
+            for v in lr.visits
+            if v.campaign is not None
+        ]
+
+    def funnel_summary(self) -> Dict[str, Any]:
+        """
+        The campaign aggregate, kept separate from the evasion attribution.
+
+        A click-through rate and the rung that held are answers to different
+        questions, and mixing them into one number is how a report starts
+        implying that a banner's CTR is a defense result. This is the whole
+        funnel in one dict, and the report prints it under its own heading.
+        """
+        events = self.campaign_events()
+        clicks = len(events)
+        landed = [e for e in events if e.landed]
+        engaged = [e for e in events if e.engaged]
+        dwell = sorted(e.dwell_s for e in engaged)
+        destinations: Dict[str, int] = {}
+        for event in events:
+            destinations[event.campaign_url] = destinations.get(event.campaign_url, 0) + 1
+        first_party = sum(1 for e in events if e.first_party)
+        iframe_clicks = sum(1 for e in events if e.frame_index > 0)
+        return {
+            "enabled": self.funnel_enabled,
+            "rate_pct": self.config.outbound_campaign_rate_pct,
+            "clicks": clicks,
+            "landed": len(landed),
+            "engaged": len(engaged),
+            "refused": len(landed) - len(engaged),
+            "unreachable": sum(
+                1
+                for e in events
+                if e.skipped_reason and not e.landed and not e.refused_by_scope
+            ),
+            "skipped_by_scope": sum(1 for e in events if e.refused_by_scope),
+            "first_party_clicks": first_party,
+            "partner_clicks": clicks - first_party,
+            "iframe_clicks": iframe_clicks,
+            "landing_rate": round(len(landed) / clicks, 4) if clicks else 0.0,
+            "dwell_p50_s": _percentile(dwell, 50),
+            "dwell_min_s": round(dwell[0], 3) if dwell else None,
+            "dwell_max_s": round(dwell[-1], 3) if dwell else None,
+            "destinations": sorted(
+                ({"url": url, "clicks": count} for url, count in destinations.items()),
+                key=lambda d: (-d["clicks"], d["url"]),
+            ),
+        }
+
     def to_dict(self) -> dict:
         return {
             "target_url": self.config.target_url,
@@ -448,5 +680,6 @@ class AuditReport:
                 "visits": self.total_visits,
                 "requests": self.total_requests,
             },
+            "funnel": self.funnel_summary(),
             "levels": [lr.to_dict() for lr in self.levels],
         }

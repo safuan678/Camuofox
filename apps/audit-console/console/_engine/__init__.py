@@ -46,6 +46,7 @@ from .config import (
     SINGLE_LEVEL_VISITORS,
     AuditConfig,
     AuditReport,
+    CampaignEvent,
     LevelResult,
     SafetyLimits,
     VisitResult,
@@ -60,7 +61,18 @@ from .evasion import (
     level_by_id,
     levels_up_to,
 )
-from .journey import ArrivalSource, JourneyConfig, VisitPlan, plan_visit
+from .journey import (
+    ArrivalSource,
+    BannerCandidate,
+    JourneyConfig,
+    OutboundPlan,
+    VisitPlan,
+    discover_banner_candidates,
+    is_ad_syndication_url,
+    parse_rate_pct,
+    plan_outbound_visit,
+    plan_visit,
+)
 from .runner import AuditRunner, SafetyStop, run_audit
 from .schedule import Arrival, ArrivalPattern, Schedule, ScheduleConfig, build_schedule
 from .scope import AuthorizationRequired, ScopeViolation, TargetScope
@@ -70,6 +82,7 @@ __all__ = [
     "AuditConfig",
     "SafetyLimits",
     "VisitResult",
+    "CampaignEvent",
     "LevelResult",
     "AuditReport",
     "SINGLE_LEVEL_VISITORS",
@@ -104,6 +117,13 @@ __all__ = [
     "VisitPlan",
     "ArrivalSource",
     "plan_visit",
+    # outbound funnel
+    "BannerCandidate",
+    "OutboundPlan",
+    "discover_banner_candidates",
+    "is_ad_syndication_url",
+    "parse_rate_pct",
+    "plan_outbound_visit",
     # runner
     "AuditRunner",
     "run_audit",

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass, field
-from typing import List, Sequence
+from typing import List, Sequence, Set
 from urllib.parse import urlparse
 
 __all__ = [
@@ -73,9 +73,24 @@ class TargetScope:
     allow_subdomains: bool = False
     acknowledged: bool = False
     acknowledgment_note: str = ""
+    #: Operator-declared campaign/partner destinations for the outbound funnel.
+    #:
+    #: Named up front, exactly like the audited hosts, because the alternative --
+    #: authorizing whatever host a banner happens to link to -- hands the target
+    #: control over what this tool may touch. Discovery is dynamic; authorization
+    #: is not.
+    outbound_hosts: List[str] = field(default_factory=list)
+    #: Hosts actually admitted from `outbound_hosts` during this session.
+    #:
+    #: Populated by `authorize_outbound()` so a report can state precisely which
+    #: destinations the run touched, rather than only which were declared.
+    session_outbound: Set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.hosts = [_normalize_host(h) for h in self.hosts if _normalize_host(h)]
+        self.outbound_hosts = [
+            _normalize_host(h) for h in self.outbound_hosts if _normalize_host(h)
+        ]
 
     # -- construction ------------------------------------------------------
 
@@ -87,6 +102,7 @@ class TargetScope:
         allow_subdomains: bool = False,
         acknowledged: bool = False,
         acknowledgment_note: str = "",
+        outbound_urls: Sequence[str] = (),
     ) -> "TargetScope":
         hosts: List[str] = []
         for url in urls:
@@ -95,11 +111,19 @@ class TargetScope:
             if not host:
                 raise ValueError(f"Could not parse a host out of {url!r}")
             hosts.append(host)
+        outbound_hosts: List[str] = []
+        for url in outbound_urls:
+            parsed = urlparse(url if "//" in url else f"//{url}")
+            host = parsed.hostname
+            if not host:
+                raise ValueError(f"Could not parse a host out of {url!r}")
+            outbound_hosts.append(host)
         return cls(
             hosts=hosts,
             allow_subdomains=allow_subdomains,
             acknowledged=acknowledged,
             acknowledgment_note=acknowledgment_note,
+            outbound_hosts=outbound_hosts,
         )
 
     # -- the gate ----------------------------------------------------------
@@ -158,6 +182,75 @@ class TargetScope:
         host = _normalize_host(urlparse(url).hostname or "")
         return self.permits(host)
 
+    # -- session-scoped outbound authorization -----------------------------
+    #
+    # The outbound-funnel audit follows promotional banners to the destination
+    # they point at, and that destination is often a partner or campaign host
+    # outside the site being audited. The convenience everyone reaches for --
+    # "the page linked it, so let the page widen the scope" -- would let the
+    # target choose what this tool is authorized to touch, which is the one
+    # thing the gate exists to prevent (a link can be injected, and an audit
+    # that follows any of them is an open request forwarder).
+    #
+    # So the ordering is explicit and stays operator-driven: the operator names
+    # the destinations up front (`outbound_hosts`), and `authorize_outbound()`
+    # admits exactly those, one hop at a time, for the duration of the run.
+    # Discovery is still dynamic -- it is read from the DOM at visit time -- but
+    # a discovered host that the operator never named is refused and *recorded*,
+    # not followed. `check_unattended()` is the non-raising form the discovery
+    # path uses so a third-party banner is reported rather than fatal.
+
+    def authorize_outbound(self, url: str) -> bool:
+        """
+        Admit one operator-declared outbound destination for this session.
+
+        Returns False without raising when the host was not declared, so the
+        discovery path can record it. Returns True when it is now authorized
+        (already in scope, or named in `outbound_hosts`).
+
+        Refuses, deliberately: any non-http(s) scheme, an IP-literal host (the
+        cloud metadata endpoint is a literal, and so is any internal service a
+        campaign link could be tricked into naming), and a host that merely
+        ends with a declared partner's name (`evil-partner.com`).
+        """
+        parsed = urlparse(url)
+        if (parsed.scheme or "").lower() not in ("http", "https"):
+            return False
+        host = _normalize_host(parsed.hostname or "")
+        if not host or _is_ip_literal(host):
+            return False
+        if self.permits(host):
+            return True
+        if host in self._outbound_allowed():
+            self.session_outbound.add(host)
+            return True
+        return False
+
+    def _outbound_allowed(self) -> Set[str]:
+        allowed: Set[str] = set()
+        for entry in self.outbound_hosts:
+            allowed.add(_normalize_host(entry))
+        return allowed
+
+    def check_unattended(self, url: str) -> bool:
+        """
+        The discovery path's check: does the outbound gate permit this URL?
+
+        Deliberately shaped like `check()` minus the raise. The funnel walk uses
+        this so an unauthorized third-party banner is a recorded finding rather
+        than an exception that aborts the visit -- the audit should report the
+        off-scope destination, not die on it. It still authorizes through
+        `authorize_outbound()`, so nothing reaches a socket that the gate refused.
+        """
+        if not self.acknowledged or not self.hosts:
+            return False
+        return self.authorize_outbound(url)
+
+    def outbound_description(self) -> str:
+        declared = ", ".join(sorted(self.outbound_hosts)) or "(none)"
+        admitted = ", ".join(sorted(self.session_outbound)) or "(none)"
+        return f"declared: {declared}; admitted this session: {admitted}"
+
     # -- description -------------------------------------------------------
 
     def describe(self) -> str:
@@ -171,6 +264,8 @@ class TargetScope:
             "allow_subdomains": self.allow_subdomains,
             "acknowledged": self.acknowledged,
             "acknowledgment_note": self.acknowledgment_note,
+            "outbound_hosts": list(self.outbound_hosts),
+            "session_outbound": sorted(self.session_outbound),
         }
 
     @classmethod
@@ -180,4 +275,6 @@ class TargetScope:
             allow_subdomains=bool(data.get("allow_subdomains")),
             acknowledged=bool(data.get("acknowledged")),
             acknowledgment_note=str(data.get("acknowledgment_note") or ""),
+            outbound_hosts=list(data.get("outbound_hosts") or []),
+            session_outbound=set(data.get("session_outbound") or ()),
         )

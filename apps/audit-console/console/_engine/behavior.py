@@ -46,6 +46,7 @@ from typing import Any, Callable, List, Optional, Tuple
 __all__ = [
     "BehaviorModel",
     "Cursor",
+    "campaign_dwell",
     "cursor_path",
     "keystroke_delays",
     "reading_pauses",
@@ -127,6 +128,39 @@ class BehaviorModel:
     #: log-normal dwell so one unlucky draw cannot hold a slot for minutes; the
     #: remainder is still spent, just in slices, so cancellation stays responsive.
     sleep_slice_s: float = 0.25
+
+    # -- campaign landing --------------------------------------------------
+    #: Landing-page dwell, in seconds, drawn log-normally between `campaign_min_s`
+    #: and `campaign_max_s`.
+    #:
+    #: Separate from `dwell_median_s`: the main visit's dwell is the site's own
+    #: reading time, while this is what a visitor spends on the *destination* a
+    #: banner promised. A reader who clicked an offer reads it, so the floor is
+    #: well above the main-visit bounce floor.
+    campaign_median_s: float = 28.0
+    campaign_sigma: float = 0.45
+    campaign_min_s: float = 15.0
+    campaign_max_s: float = 60.0
+    #: Scroll bursts on the destination, before the reader settles.
+    campaign_scroll_bursts_min: int = 2
+    campaign_scroll_bursts_max: int = 6
+
+
+def campaign_dwell(rng: random.Random, model: Optional[BehaviorModel] = None) -> float:
+    """
+    How long a visitor spends on a banner's landing page, in seconds.
+
+    Log-normal within [campaign_min_s, campaign_max_s], because landing-page
+    attention has the same right-skewed shape as reading time on the site itself:
+    most visitors decide quickly, a few read the whole offer. Uniform would make
+    every click-through the same length, which is a cadence tell on a page the
+    audit is trying to measure honestly.
+    """
+    model = model or BehaviorModel()
+    value = rng.lognormvariate(
+        math.log(max(model.campaign_median_s, 1e-6)), model.campaign_sigma
+    )
+    return float(min(max(value, model.campaign_min_s), model.campaign_max_s))
 
 
 async def viewport_size(page: Any, default: Tuple[int, int] = (1280, 720)) -> Tuple[int, int]:
@@ -345,6 +379,34 @@ class Cursor:
             return False
         await asyncio.sleep(self._rng.uniform(*self._model.post_click_s))
         return True
+
+    async def click_locator(self, locator: Any, *, min_distance: float = 6.0) -> bool:
+        """
+        Bring a control into view, then approach and press it like a hand would.
+
+        The sequence matters and is the same one a real click has: scroll the
+        element into the viewport, read its geometry, then travel to a point
+        inside it -- jittered within the box rather than aimed at its exact
+        centre, which is a coordinate a person does not compute -- and press with
+        a held duration. `min_distance` keeps a second click on the same control
+        from degenerating into zero-length jitter.
+
+        Returns False (rather than raising) when the element cannot be reached,
+        so a caller can fall back to a direct navigation.
+        """
+        try:
+            await locator.scroll_into_view_if_needed(timeout=3000)
+            box = await locator.bounding_box()
+            if not box:
+                return False
+            await self.move_to(
+                box["x"] + box["width"] * self._rng.uniform(0.25, 0.75),
+                box["y"] + box["height"] * self._rng.uniform(0.35, 0.65),
+                min_distance=min_distance,
+            )
+            return await self.click()
+        except Exception:
+            return False
 
     async def scroll(
         self, bursts: int, distance_px: Optional[float] = None, deadline: Optional[float] = None

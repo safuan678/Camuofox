@@ -194,7 +194,7 @@ Layout:
 | `scope.py` | `TargetScope` — the authorization gate. Every navigation goes through `check()`. |
 | `detection.py` | `classify_response()` → `Verdict`, with vendor attribution and evidence. |
 | `evasion.py` | `EVASION_LEVELS` — the ladder; each rung says what it isolates, and declares its cumulative `capabilities` + the one `adds`. |
-| `journey.py` | `plan_visit()` — human-like navigation (referers, dwell, sampling). Pass `behavior=False` for the rungs below L5. |
+| `journey.py` | `plan_visit()` — human-like navigation (referers, dwell, sampling). Pass `behavior=False` for the rungs below L5. Also `discover_banner_candidates()` / `plan_outbound_visit()` for the outbound funnel. |
 | `schedule.py` | `build_schedule()` — non-uniform, jittered arrivals across a window. |
 | `runner.py` | `AuditRunner` — async execution, ceilings, progress events, cancellation. |
 | `report.py` | Findings, text/HTML/JSON/CSV export. |
@@ -205,6 +205,70 @@ bound to the **Audit** tab in `qml/main.qml`. The audit runs on a `QThread` so t
 event loop stays responsive and Stop always works.
 
 CLI: `camoufox audit levels|run|report`.
+
+### Outbound funnel (promotional-banner click-through)
+
+`AuditConfig.enable_outbound_funnel` turns on a click-through audit layered on a
+behavioral rung. The runner reads the promotional banners the page actually
+serves (`AuditConfig.include_iframes`, default on, also reads child frames),
+rolls a per-visitor CTR, follows the chosen banner to its destination,
+and measures landing-page engagement. It is **observation only** — it records
+what the audited site served and where it pointed, and never drives a conversion.
+
+- **A URL found in the DOM is not an authorized host.** This is the load-bearing
+  rule. The feature's own spec asked for "dynamic scope management" from
+  DOM-extracted URLs, and the tempting implementation — let the page widen the
+  scope — would hand the *target* control over what this tool may touch (a link
+  can be injected, and an audit that follows any of them is an open request
+  forwarder). So discovery is dynamic, authorization is not: the operator names
+  partner hosts up front in `TargetScope.outbound_hosts` (the
+  `outbound_urls=` argument to `from_urls`, the "Partner campaign hosts" GUI
+  field), and `check_unattended()` admits exactly those. An undeclared banner is
+  **seen and reported as a refusal**, never followed.
+- **The outbound gate refuses more than an unknown host.** `authorize_outbound()`
+  rejects non-http(s) schemes, IP-literal hosts (the cloud metadata endpoint is a
+  literal, and so is any internal service a campaign link could be tricked into
+  naming), and a host that merely ends with a declared partner's name
+  (`evil-partner.example.net` must not match `partner.example.net`).
+- **The funnel only runs on a behavior rung.** `_funnel_applies()` gates it to
+  L5+, because a click-through is an interaction, and emitting one on a rung that
+  does not claim behavior would make that rung's verdict the product of an
+  interaction it never claimed. Enabling the funnel with no behavioral rung
+  selected disables it with a notice rather than silently doing nothing.
+- **Iframe banners are read through the frame, not through the page.**
+  `include_iframes` (default **on**) widens *discovery* to child frames, because a
+  campaign is routinely served from an ad iframe — a main-frame-only scan reports
+  "no banner found" on a page that is showing one, which is a false negative about
+  the very funnel being measured. Playwright's `page.locator()` is
+  `mainFrame().locator()`, so a child frame's anchors are invisible to any
+  page-level query: the runner must call `evaluate` on each frame
+  (`_collect_banner_anchors`) and click the frame's own locator. Widening frames
+  must **never** widen authorization: `discover_banner_candidates` applies the
+  same `TargetScope` gate to a framed anchor as to a main-document one, and a
+  frame is untrusted content, so treating frame-extracted URLs as more trusted
+  would invert the whole rule above. `include_iframes=False` *drops* framed
+  anchors before the gate, so excluding frames cannot leave a frame destination
+  counted in the refusal evidence either.
+- **A candidate's frame ordinal is 0 for the main document and counts child
+  frames from 1.** The click resolves the ordinal back through
+  `_frame_for()`/`_child_frames()`, which assert that `page.frames[0]` is
+  `main_frame` rather than assuming it — an enumerate-from-zero would make child
+  frame 1 alias the top-level document and aim the cursor at the wrong geometry
+  (or at nothing at all). An ordinal that no longer resolves (the frame was
+  removed between discovery and the click) aborts the hop with a recorded reason
+  rather than falling back to the main document. Playwright reports a frame
+  element's box in top-level viewport coordinates, so the same `Cursor` motion
+  works for both, and the mouse stays a page-level input.
+- **`engaged` excludes a landing that refused to serve.** A 403 landing page is
+  reachable but not engaged, so dwell/glance/scroll statistics count only the
+  destinations that actually served the offer. Reporting a blocked landing as
+  "engaged" would credit the campaign with a visit the visitor never had.
+- **The rate is parsed once and bounded.** `parse_rate_pct()` reads what an
+  operator types (`2.5`, `2.5%`, `"0.05"`), rejects junk rather than coercing it
+  (a silently misread rate is traffic the operator did not authorize), and clamps
+  to `[0, 30]`. `AuditConfig.__post_init__` normalizes through it only when the
+  funnel is on — with it off the rate decides no traffic, so an unreadable value
+  must not block an otherwise well-defined run.
 
 Invariants worth not breaking:
 
