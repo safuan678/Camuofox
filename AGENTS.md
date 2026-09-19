@@ -69,7 +69,7 @@ visible without a token. `ci/tests/test_ci.py` locks all of this.
 - `pythonlib/camoufox/fingerprints.py` — `generate_context_fingerprint()` (BrowserForge + presets).
 - `pythonlib/camoufox/server.py` — `launch_server()`, websocket Playwright server.
 - `pythonlib/camoufox/__main__.py` — the `camoufox` CLI (fetch/set/sync/list/remove/test/server/gui/version/path/active).
-- `pythonlib/camoufox/gui/` — Qt/QML manager UI (`backend.py` + `qml/main.qml`).
+- `pythonlib/camoufox/gui/` — Qt/QML manager UI (`backend.py` + `qml/main.qml`, pages in `qml/tabs/`).
 - `additions/camoucfg/MaskConfig.hpp` — reads `CAMOU_CONFIG_1..N`, falls back to `CAMOU_CONFIG`.
 - `additions/camoucfg/MouseTrajectories.hpp` — humanized cursor algorithm.
 - `additions/juggler/` — patched Juggler; `content/main.js` + `protocol/PageHandler.js` are the core.
@@ -201,8 +201,23 @@ Layout:
 | `config.py` | `AuditConfig`, `SafetyLimits`, `VisitResult`, `LevelResult`, `AuditReport`. |
 
 GUI: `pythonlib/camoufox/gui/audit_backend.py` (`AuditBackend` + `AuditVisitModel`)
-bound to the **Audit** tab in `qml/main.qml`. The audit runs on a `QThread` so the
-event loop stays responsive and Stop always works.
+drives the audit pages. The audit runs on a `QThread` so the event loop stays
+responsive and Stop always works.
+
+The QML is split by page: `qml/main.qml` holds the shell (tab bar, sidebar,
+status bar) plus the Browsers/GeoIP/Info pages, and `qml/tabs/` holds one file per
+audit page — `AuditTab.qml` (configuration + live run), `LogsTab.qml` (run log),
+`ReportsTab.qml` (findings, per-level table, funnel, report files). The tab bar in
+`main.qml` owns the index (`id: tabBar`, `property int active`) and the
+`StackLayout` binds to it; callers switch pages with `root.openTab(i)` rather than
+assigning `currentIndex`, so the highlight and the visible page cannot drift apart.
+Adding a page means a new `tabs/*.qml`, an entry in `tabs/qmldir`, a label in
+`tabBar.labels`, and a child of the `StackLayout` — in that order.
+
+`packaging/camoufox_launcher.py --self-check` loads `main.qml` offscreen and
+asserts every `auditBackend.*` name referenced anywhere under `qml/` resolves
+against the backend's real Qt API, so a rename in `audit_backend.py` fails the
+check instead of silently breaking a binding at runtime.
 
 CLI: `camoufox audit levels|run|report`.
 

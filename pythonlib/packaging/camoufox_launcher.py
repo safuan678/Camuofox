@@ -126,9 +126,20 @@ def _self_check() -> int:
         #
         # The names come from the QML itself rather than a hand-kept list. A list
         # only covers what someone remembered to add, and this check exists
-        # precisely for the binding nobody thought about.
+        # precisely for the binding nobody thought about. Every QML file is
+        # scanned, not just the one the engine was pointed at: the tabs live in
+        # their own files, and a check that only read main.qml would have gone
+        # quietly blind the moment they moved.
+        sources = sorted(qml.parent.rglob("*.qml"))
         referenced = sorted(
-            set(re.findall(r"auditBackend\.([A-Za-z_][A-Za-z0-9_]*)", qml.read_text(encoding="utf-8")))
+            {
+                name
+                for source in sources
+                for name in re.findall(
+                    r"auditBackend\.([A-Za-z_][A-Za-z0-9_]*)",
+                    source.read_text(encoding="utf-8"),
+                )
+            }
         )
         if not referenced:
             _record("self-check FAILED: no auditBackend bindings found in the QML\n")
@@ -146,7 +157,8 @@ def _self_check() -> int:
 
         _record(
             f"self-check OK: QML {qml.name}, {len(roots)} root object(s), "
-            f"{len(referenced)} audit bindings resolved\n"
+            f"{len(referenced)} audit bindings resolved across "
+            f"{len(sources)} file(s)\n"
         )
         del engine
         del app

@@ -991,3 +991,69 @@ class AuditBackend(QObject):
             self._error = f"Export failed: {exc}"
             self.changed.emit()
             return False
+
+    @Slot(result="QVariantMap")
+    def browseExportText(self) -> dict:
+        """
+        Ask where to save a plain-text summary, then write it there.
+
+        The engine's own reports land in the run's output directory, which is
+        fine for a machine but awkward when an operator wants to attach one to a
+        ticket. This is that escape hatch.
+
+        Like browseProxyFile, QFileDialog needs QtWidgets, which this app does
+        not otherwise import, and its native path wants a QApplication rather
+        than the QGuiApplication the app creates; both are handled so a build
+        without them degrades to a message instead of crashing the GUI.
+        """
+        try:
+            from PySide6.QtWidgets import QFileDialog
+        except Exception:
+            return {
+                "ok": False,
+                "path": "",
+                "message": "A file chooser is unavailable in this build.",
+            }
+
+        start = str(Path(self._out_dir).expanduser()) if self._out_dir else str(Path.home())
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                None,
+                "Save audit summary",
+                str(Path(start) / "audit-summary.txt"),
+                "Text files (*.txt);;All files (*)",
+                options=QFileDialog.Option.DontUseNativeDialog,
+            )
+        except Exception as exc:
+            return {"ok": False, "path": "", "message": f"Could not open a file chooser ({exc})."}
+
+        if not path:
+            return {"ok": False, "path": "", "message": "No file selected."}
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        ok = self.exportText(path)
+        return {
+            "ok": ok,
+            "path": path,
+            "message": f"Saved to {path}" if ok else "Could not write the summary.",
+        }
+
+    @Slot(str, result=bool)
+    def openPath(self, path: str) -> bool:
+        """Open a report in whatever the desktop uses for that file type."""
+        if not path:
+            return False
+        target = Path(path)
+        if not target.exists():
+            self._error = f"Not found: {path}"
+            self.changed.emit()
+            return False
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+
+            return QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        except Exception as exc:
+            self._error = f"Could not open {path}: {exc}"
+            self.changed.emit()
+            return False
