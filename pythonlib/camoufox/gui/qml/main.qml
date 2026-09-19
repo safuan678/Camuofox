@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "theme"
+import "components"
 
 ApplicationWindow {
     id: root
@@ -10,345 +12,17 @@ ApplicationWindow {
     minimumWidth: 640
     minimumHeight: 400
     title: "Camoufox Manager"
-    color: c.bg
+    color: Theme.bg
 
-    FontLoader { id: segoe; source: "../assets/SegUIVar.ttf" }
-    FontLoader { id: mdl2; source: "../assets/segmdl2.ttf" }
-
-    // 4pt spacing scale
+    //: UI scale. Theme owns every metric derived from it, so assigning here
+    //: resizes the whole interface; the debug slider below is the only writer.
     property real scale: 1.0
-    readonly property int row: Math.round(32 * scale)
-    readonly property int s1: Math.round(4 * scale)
-    readonly property int s2: Math.round(8 * scale)
-    readonly property int s3: Math.round(12 * scale)
-    readonly property int s4: Math.round(16 * scale)
-    readonly property int textSm: Math.round(12 * scale)
-    readonly property int textMd: Math.round(14 * scale)
-    readonly property int colW: Math.round(100 * scale)
-    readonly property int verColW: Math.round(70 * scale)
-    readonly property int dateColW: Math.round(90 * scale)
-    readonly property string fontMain: segoe.name
-    readonly property string fontIcon: mdl2.name
+    Binding { target: Theme; property: "scale"; value: root.scale }
 
     property string geoipDlgSource: ""
 
-    QtObject {
-        id: c
-        readonly property color bg: "#181818"
-        readonly property color fg: "#1f1f1f"
-        readonly property color raised: "#282828"
-        readonly property color border: "#383838"
-        readonly property color text: "#ffffff"
-        readonly property color muted: "#a0a0a0"
-        readonly property color dim: "#606060"
-        readonly property color accent: "#569cd6"
-        readonly property color ok: "#6b9e7e"
-        readonly property color err: "#f14c4c"
-    }
+    // Primitives live in components/; see theme/Theme.qml for colours and sizes.
 
-    // Primitives
-
-    component T: Text {
-        color: c.text
-        font.family: fontMain
-        font.pixelSize: textSm
-    }
-
-    component Muted: Text {
-        color: c.muted
-        font.family: fontMain
-        font.pixelSize: textSm
-    }
-
-    component Bold: Text {
-        color: c.text
-        font.family: fontMain
-        font.pixelSize: textSm
-        font.weight: Font.DemiBold
-    }
-
-    component Header: Text {
-        color: c.muted
-        font.family: fontMain
-        font.pixelSize: Math.round(10 * scale)
-        font.weight: Font.DemiBold
-        font.letterSpacing: 0.5
-    }
-
-    component Icon: Text {
-        property string icon: ""
-        text: icon
-        color: c.text
-        font.family: fontIcon
-        font.pixelSize: textSm
-    }
-
-    component Rule: Rectangle {
-        width: parent ? parent.width : 0
-        height: 1
-        color: c.border
-    }
-
-    component Btn: Rectangle {
-        property string text: ""
-        property string icon: ""
-        property bool on: true
-        property color accent: c.text
-        signal clicked
-
-        width: _row.implicitWidth + s3
-        height: row - s2
-        radius: s1
-        color: on && _ma.containsMouse ? c.raised : "transparent"
-        border.color: c.border
-        border.width: 1
-        opacity: on ? 1 : 0.4
-
-        Row {
-            id: _row
-            anchors.centerIn: parent
-            spacing: (icon && text) ? s1 : 0
-
-            Icon {
-                visible: !!icon
-                anchors.verticalCenter: parent.verticalCenter
-                icon: _row.parent.icon
-                color: _row.parent.on ? _row.parent.accent : c.muted
-            }
-
-            T {
-                visible: !!text
-                anchors.verticalCenter: parent.verticalCenter
-                text: _row.parent.text
-                color: _row.parent.on ? _row.parent.accent : c.muted
-            }
-        }
-
-        MouseArea {
-            id: _ma
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: on ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: if (parent.on) parent.clicked()
-        }
-    }
-
-    component Tag: Rectangle {
-        property alias text: lbl.text
-        property color accent: c.ok
-
-        width: lbl.width + s3
-        height: row - s3
-        radius: s1
-        color: Qt.rgba(accent.r, accent.g, accent.b, 0.15)
-        border.color: accent
-        border.width: 1
-
-        T {
-            id: lbl
-            anchors.centerIn: parent
-            color: parent.accent
-            font.capitalization: Font.Capitalize
-        }
-    }
-
-    component PinButton: Item {
-        id: pinButton
-        property bool pinned: false
-        property string pinToolTip: "Pin version"
-        property string unpinToolTip: "Unpin version"
-        signal clicked
-
-        width: s4
-        height: s4
-
-        Icon {
-            anchors.centerIn: parent
-            icon: "\uE840"
-            color: pinButton.pinned ? c.accent : c.muted
-            opacity: pinButton.enabled ? 1 : 0.4
-        }
-
-        Icon {
-            anchors.centerIn: parent
-            icon: "\uE842"
-            color: c.accent
-            opacity: pinButton.enabled ? 1 : 0.4
-            visible: pinButton.pinned
-        }
-
-        MouseArea {
-            id: pinMa
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: pinButton.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: if (pinButton.enabled) pinButton.clicked()
-        }
-
-        ToolTip.visible: pinMa.containsMouse && pinButton.enabled
-        ToolTip.text: pinButton.pinned ? pinButton.unpinToolTip : pinButton.pinToolTip
-        ToolTip.delay: 500
-    }
-
-    component Input: Rectangle {
-        property alias text: inp.text
-        property alias input: inp
-        property string placeholder: ""
-        signal editingFinished
-
-        width: Math.round(160 * scale)
-        height: row - s2
-        radius: s1
-        color: c.raised
-        border.color: inp.activeFocus ? c.accent : c.border
-        border.width: 1
-
-        TextInput {
-            id: inp
-            anchors.fill: parent
-            leftPadding: s2
-            rightPadding: s2
-            color: c.text
-            font.family: fontMain
-            font.pixelSize: textSm
-            verticalAlignment: Text.AlignVCenter
-            onEditingFinished: parent.editingFinished()
-        }
-
-        Muted {
-            anchors.left: parent.left
-            anchors.leftMargin: s2
-            anchors.verticalCenter: parent.verticalCenter
-            text: placeholder
-            visible: !inp.text && !inp.activeFocus
-        }
-    }
-
-    component ProgressBar: Rectangle {
-        id: _bar
-        property real value: -1
-        property bool active: false
-
-        height: s1
-        radius: s1 / 2
-        color: c.raised
-
-        Rectangle {
-            id: _fill
-            x: 0
-            width: _bar.value >= 0 ? _bar.width * _bar.value : _bar.width * 0.3
-            height: parent.height
-            radius: parent.radius
-            color: c.accent
-        }
-
-        Timer {
-            interval: 16; repeat: true
-            running: _bar.active && _bar.value < 0
-            property real pos: 0
-            property bool fwd: true
-            onTriggered: {
-                if (fwd) { pos += 0.02; if (pos >= 0.7) fwd = false }
-                else { pos -= 0.02; if (pos <= 0) fwd = true }
-                _fill.x = _bar.width * pos
-            }
-            onRunningChanged: if (!running) { pos = 0; _fill.x = 0 }
-        }
-    }
-
-    component Combo: ComboBox {
-        id: cb
-        implicitWidth: colW
-        implicitHeight: row - s2
-
-        background: Rectangle {
-            color: c.raised
-            radius: s1
-            border.color: c.border
-            border.width: 1
-        }
-
-        contentItem: T {
-            text: cb.displayText
-            leftPadding: s2
-            verticalAlignment: Text.AlignVCenter
-        }
-
-        delegate: ItemDelegate {
-            required property int index
-            required property string modelData
-            width: cb.width
-            height: row - s2
-            contentItem: T {
-                text: modelData
-                verticalAlignment: Text.AlignVCenter
-            }
-            background: Rectangle {
-                color: highlighted ? c.raised : c.fg
-            }
-        }
-    }
-
-    component SideRow: Rectangle {
-        property bool sel: false
-        property bool bar: false
-        signal clicked
-
-        width: parent ? parent.width : 0
-        height: row
-        color: sel ? c.raised : ma.containsMouse ? c.raised : "transparent"
-
-        Rectangle {
-            visible: bar && sel
-            width: s1
-            height: parent.height
-            color: c.accent
-        }
-
-        MouseArea {
-            id: ma
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: parent.clicked()
-        }
-    }
-
-    component Panel: Rectangle {
-        default property alias content: col.children
-        property string title: ""
-
-        color: c.bg
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
-
-            Rectangle {
-                Layout.fillWidth: true
-                height: row
-                color: c.fg
-
-                Rule { anchors.bottom: parent.bottom }
-
-                Header {
-                    anchors.left: parent.left
-                    anchors.leftMargin: s3
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: title
-                }
-            }
-
-            ColumnLayout {
-                id: col
-                Layout.fillWidth: true
-                Layout.margins: s4
-                spacing: s3
-            }
-
-            Item { Layout.fillHeight: true }
-        }
-    }
 
     // Dialog
 
@@ -382,11 +56,11 @@ ApplicationWindow {
     Rectangle {
         visible: dlgAct !== ""
         anchors.centerIn: parent
-        width: Math.round(340 * scale)
-        height: dlgContent.height + s4 * 2
-        color: c.fg
-        border.color: c.border
-        radius: s2
+        width: Math.round(340 * Theme.scale)
+        height: dlgContent.height + Theme.s4 * 2
+        color: Theme.fg
+        border.color: Theme.border
+        radius: Theme.s2
         z: 101
 
         Column {
@@ -394,15 +68,15 @@ ApplicationWindow {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
-            anchors.margins: s4
-            spacing: s3
+            anchors.margins: Theme.s4
+            spacing: Theme.s3
 
             Bold {
                 text: (dlgAct === "install" || dlgAct === "promptInstall") ? "Install"
                      : dlgAct === "uninstall" ? "Uninstall"
                      : dlgAct === "promptPin" ? "Pin Version"
                      : dlgAct === "promptFollow" ? "Follow Channel" : "Set Active"
-                font.pixelSize: textMd
+                font.pixelSize: Theme.textMd
             }
 
             T {
@@ -422,16 +96,16 @@ ApplicationWindow {
             T {
                 visible: (dlgAct === "install" || dlgAct === "promptInstall") && backend.selectedIsPrerelease
                 width: parent.width
-                color: c.err
+                color: Theme.err
                 wrapMode: Text.Wrap
                 text: "Warning: Prerelease versions may be unstable."
             }
 
-            Item { width: 1; height: s1 }
+            Item { width: 1; height: Theme.s1 }
 
             Row {
                 anchors.right: parent.right
-                spacing: s2
+                spacing: Theme.s2
 
                 Btn {
                     text: (dlgAct === "promptInstall" || dlgAct === "promptPin" || dlgAct === "promptFollow") ? "Skip" : "Cancel"
@@ -441,7 +115,7 @@ ApplicationWindow {
                 Btn {
                     visible: dlgAct === "promptFollow"
                     text: "Pin Version"
-                    accent: c.accent
+                    accent: Theme.accent
                     onClicked: {
                         backend.setActive(dlgIdx)
                         dlgAct = ""
@@ -453,8 +127,8 @@ ApplicationWindow {
                         : dlgAct === "uninstall" ? "Uninstall"
                         : dlgAct === "promptPin" ? "Pin Version"
                         : dlgAct === "promptFollow" ? "Follow Channel" : "Set Active"
-                    accent: dlgAct === "uninstall" ? c.err
-                        : (dlgAct === "install" || dlgAct === "promptInstall") ? c.ok : c.accent
+                    accent: dlgAct === "uninstall" ? Theme.err
+                        : (dlgAct === "install" || dlgAct === "promptInstall") ? Theme.ok : Theme.accent
                     onClicked: {
                         if (dlgAct === "install" || dlgAct === "promptInstall") {
                             backend.installSelected()
@@ -507,36 +181,36 @@ ApplicationWindow {
         // Tab bar
         Rectangle {
             Layout.fillWidth: true
-            height: row
-            color: c.fg
+            height: Theme.row
+            color: Theme.fg
 
             Rule { anchors.bottom: parent.bottom }
 
             Row {
                 anchors.left: parent.left
-                anchors.leftMargin: s3
+                anchors.leftMargin: Theme.s3
                 anchors.verticalCenter: parent.verticalCenter
 
                 Repeater {
                     model: ["Browsers", "GeoIP", "Info", "Audit"]
 
                     Rectangle {
-                        width: tabLbl.width + s4 * 2
-                        height: row
+                        width: tabLbl.width + Theme.s4 * 2
+                        height: Theme.row
                         color: "transparent"
 
                         T {
                             id: tabLbl
                             anchors.centerIn: parent
                             text: modelData
-                            color: tabs.currentIndex === index ? c.accent : c.muted
+                            color: tabs.currentIndex === index ? Theme.accent : Theme.muted
                         }
 
                         Rectangle {
                             anchors.bottom: parent.bottom
                             width: parent.width
-                            height: s1 / 2
-                            color: c.accent
+                            height: Theme.s1 / 2
+                            color: Theme.accent
                             visible: tabs.currentIndex === index
                         }
 
@@ -557,16 +231,16 @@ ApplicationWindow {
 
             // Sidebar
             Rectangle {
-                Layout.preferredWidth: Math.round(210 * scale)
+                Layout.preferredWidth: Math.round(210 * Theme.scale)
                 Layout.fillHeight: true
-                color: c.fg
+                color: Theme.fg
                 visible: tabs.currentIndex === 0
 
                 Rectangle {
                     anchors.right: parent.right
                     width: 1
                     height: parent.height
-                    color: c.border
+                    color: Theme.border
                 }
 
                 Column {
@@ -577,12 +251,12 @@ ApplicationWindow {
 
                     Rectangle {
                         width: parent.width
-                        height: row
+                        height: Theme.row
                         color: "transparent"
 
                         Header {
                             anchors.left: parent.left
-                            anchors.leftMargin: s3
+                            anchors.leftMargin: Theme.s3
                             anchors.verticalCenter: parent.verticalCenter
                             text: "REPOSITORIES"
                         }
@@ -601,7 +275,7 @@ ApplicationWindow {
 
                             T {
                                 anchors.left: parent.left
-                                anchors.leftMargin: s4
+                                anchors.leftMargin: Theme.s4
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: modelData
                             }
@@ -619,12 +293,12 @@ ApplicationWindow {
 
                     Rectangle {
                         width: parent.width
-                        height: row
+                        height: Theme.row
                         color: "transparent"
 
                         Header {
                             anchors.left: parent.left
-                            anchors.leftMargin: s3
+                            anchors.leftMargin: Theme.s3
                             anchors.verticalCenter: parent.verticalCenter
                             text: "FOLLOW CHANNEL"
                         }
@@ -635,19 +309,19 @@ ApplicationWindow {
 
                         Rectangle {
                             width: parent ? parent.width : 0
-                            height: row + s2
-                            color: chMa.containsMouse ? c.raised : "transparent"
+                            height: Theme.row + Theme.s2
+                            color: chMa.containsMouse ? Theme.raised : "transparent"
 
                             Column {
                                 anchors.left: parent.left
-                                anchors.leftMargin: s4
+                                anchors.leftMargin: Theme.s4
                                 anchors.right: parent.right
-                                anchors.rightMargin: s3
+                                anchors.rightMargin: Theme.s3
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 1
 
                                 Row {
-                                    spacing: s2
+                                    spacing: Theme.s2
                                     PinButton {
                                         pinned: backend.followedChannel === backend.channelKeys[index]
                                         pinToolTip: "Follow channel"
@@ -659,9 +333,9 @@ ApplicationWindow {
                                 }
 
                                 Muted {
-                                    leftPadding: s4 + s2
+                                    leftPadding: Theme.s4 + Theme.s2
                                     text: backend.channelLatest[index] ? ("Latest: " + backend.channelLatest[index]) : "(sync first)"
-                                    font.pixelSize: Math.round(10 * scale)
+                                    font.pixelSize: Math.round(10 * Theme.scale)
                                 }
                             }
 
@@ -685,7 +359,7 @@ ApplicationWindow {
 
                 // Browsers
                 Rectangle {
-                    color: c.bg
+                    color: Theme.bg
 
                     ColumnLayout {
                         anchors.fill: parent
@@ -693,42 +367,42 @@ ApplicationWindow {
 
                         Rectangle {
                             Layout.fillWidth: true
-                            height: row
-                            color: c.fg
+                            height: Theme.row
+                            color: Theme.fg
 
                             Rule { anchors.bottom: parent.bottom }
 
                             Row {
                                 anchors.left: parent.left
-                                anchors.leftMargin: s3
+                                anchors.leftMargin: Theme.s3
                                 anchors.verticalCenter: parent.verticalCenter
-                                spacing: s3
+                                spacing: Theme.s3
 
                                 Rectangle {
-                                    width: s3
-                                    height: s3
-                                    radius: s1
+                                    width: Theme.s3
+                                    height: Theme.s3
+                                    radius: Theme.s1
                                     color: "transparent"
-                                    border.color: c.dim
+                                    border.color: Theme.dim
                                     border.width: 1
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
                                 Header {
                                     text: "VERSION"
-                                    width: verColW
+                                    width: Theme.verColW
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
                                 Header {
                                     text: "BUILD"
-                                    width: verColW
+                                    width: Theme.verColW
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
                                 Header {
                                     text: "DATE"
-                                    width: dateColW
+                                    width: Theme.dateColW
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
 
@@ -752,9 +426,9 @@ ApplicationWindow {
                                 id: vScrollBar
                                 policy: vList.contentHeight > vList.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
                                 contentItem: Rectangle {
-                                    implicitWidth: s2
-                                    radius: s1
-                                    color: c.border
+                                    implicitWidth: Theme.s2
+                                    radius: Theme.s1
+                                    color: Theme.border
                                 }
                             }
 
@@ -763,36 +437,36 @@ ApplicationWindow {
                                 property bool hov: hover.hovered
 
                                 width: vList.width - vList.scrollBarWidth
-                                height: row
-                                color: model.isHeader ? c.fg :
-                                       model.isPinned ? Qt.rgba(c.accent.r, c.accent.g, c.accent.b, 0.06) :
+                                height: Theme.row
+                                color: model.isHeader ? Theme.fg :
+                                       model.isPinned ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.06) :
                                        hov ? Qt.rgba(1, 1, 1, 0.02) : "transparent"
 
                                 Rectangle {
                                     anchors.top: parent.top
                                     width: parent.width
                                     height: 1
-                                    color: model.isHeader && index > 0 ? c.border : "transparent"
+                                    color: model.isHeader && index > 0 ? Theme.border : "transparent"
                                 }
 
                                 Rectangle {
                                     anchors.bottom: parent.bottom
                                     width: parent.width
                                     height: 1
-                                    color: model.isHeader ? c.border : "transparent"
+                                    color: model.isHeader ? Theme.border : "transparent"
                                 }
 
                                 Rectangle {
-                                    width: s1
+                                    width: Theme.s1
                                     height: parent.height
-                                    color: model.isPinned && !model.isHeader ? c.accent : "transparent"
+                                    color: model.isPinned && !model.isHeader ? Theme.accent : "transparent"
                                 }
 
                                 HoverHandler { id: hover }
 
                                 Bold {
                                     anchors.left: parent.left
-                                    anchors.leftMargin: s3
+                                    anchors.leftMargin: Theme.s3
                                     anchors.verticalCenter: parent.verticalCenter
                                     visible: model.isHeader
                                     text: model.display
@@ -800,9 +474,9 @@ ApplicationWindow {
 
                                 RowLayout {
                                     anchors.fill: parent
-                                    anchors.leftMargin: s3
-                                    anchors.rightMargin: s2
-                                    spacing: s3
+                                    anchors.leftMargin: Theme.s3
+                                    anchors.rightMargin: Theme.s2
+                                    spacing: Theme.s3
                                     visible: !model.isHeader
 
                                     PinButton {
@@ -819,24 +493,24 @@ ApplicationWindow {
 
                                     T {
                                         text: model.display
-                                        color: model.isInstalled ? c.text : c.dim
-                                        Layout.preferredWidth: verColW
+                                        color: model.isInstalled ? Theme.text : Theme.dim
+                                        Layout.preferredWidth: Theme.verColW
                                     }
 
                                     T {
                                         text: model.build
-                                        color: model.isInstalled ? c.text : c.dim
-                                        Layout.preferredWidth: verColW
+                                        color: model.isInstalled ? Theme.text : Theme.dim
+                                        Layout.preferredWidth: Theme.verColW
                                     }
 
                                     T {
                                         text: model.date
-                                        color: model.isInstalled ? c.text : c.dim
-                                        Layout.preferredWidth: dateColW
+                                        color: model.isInstalled ? Theme.text : Theme.dim
+                                        Layout.preferredWidth: Theme.dateColW
                                     }
 
                                     Row {
-                                        spacing: s2
+                                        spacing: Theme.s2
                                         Layout.fillWidth: true
 
                                         Tag {
@@ -847,7 +521,7 @@ ApplicationWindow {
                                         Tag {
                                             visible: model.isActive
                                             text: "active"
-                                            accent: c.accent
+                                            accent: Theme.accent
                                         }
 
                                         Tag {
@@ -860,7 +534,7 @@ ApplicationWindow {
                                         visible: vrow.hov && !model.isInstalled
                                         icon: "\uE896"
                                         text: "Download"
-                                        accent: c.ok
+                                        accent: Theme.ok
                                         on: !backend.busy
                                         onClicked: showDlg("install", index, model.display, model.build)
                                     }
@@ -869,7 +543,7 @@ ApplicationWindow {
                                         visible: vrow.hov && model.isInstalled
                                         icon: "\uE74D"
                                         text: "Delete"
-                                        accent: c.err
+                                        accent: Theme.err
                                         on: !backend.busy
                                         onClicked: showDlg("uninstall", index, model.display, model.build)
                                     }
@@ -882,7 +556,7 @@ ApplicationWindow {
 
                 // GeoIP
                 Rectangle {
-                    color: c.bg
+                    color: Theme.bg
 
                     ColumnLayout {
                         anchors.fill: parent
@@ -890,14 +564,14 @@ ApplicationWindow {
 
                         Rectangle {
                             Layout.fillWidth: true
-                            height: row
-                            color: c.fg
+                            height: Theme.row
+                            color: Theme.fg
 
                             Rule { anchors.bottom: parent.bottom }
 
                             Header {
                                 anchors.left: parent.left
-                                anchors.leftMargin: s3
+                                anchors.leftMargin: Theme.s3
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: "GEOIP DATABASE"
                             }
@@ -906,25 +580,25 @@ ApplicationWindow {
                         Rectangle {
                             Layout.fillWidth: true
                             visible: !backend.geoipAvailable
-                            height: visible ? notInstalledCol.height + s4 * 2 : 0
-                            color: c.fg
+                            height: visible ? notInstalledCol.height + Theme.s4 * 2 : 0
+                            color: Theme.fg
 
                             ColumnLayout {
                                 id: notInstalledCol
                                 anchors.centerIn: parent
-                                spacing: s2
+                                spacing: Theme.s2
 
                                 T {
                                     Layout.alignment: Qt.AlignHCenter
                                     text: "IP Geolocation support is missing."
-                                    font.pixelSize: textMd
+                                    font.pixelSize: Theme.textMd
                                 }
 
                                 T {
                                     Layout.alignment: Qt.AlignHCenter
                                     text: "Run: pip install camoufox[geoip]"
-                                    color: c.muted
-                                    font.family: root.fontMain
+                                    color: Theme.muted
+                                    font.family: root.Theme.fontMain
                                 }
                             }
                         }
@@ -944,14 +618,14 @@ ApplicationWindow {
                                     property bool downloaded: backend.geoipDownloaded.indexOf(modelData) >= 0
 
                                     width: parent.width
-                                    height: row
-                                    color: active ? Qt.rgba(c.accent.r, c.accent.g, c.accent.b, 0.06) :
+                                    height: Theme.row
+                                    color: active ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.06) :
                                            hov ? Qt.rgba(1, 1, 1, 0.02) : "transparent"
 
                                     Rectangle {
-                                        width: s1
+                                        width: Theme.s1
                                         height: parent.height
-                                        color: geoRow.active ? c.accent : "transparent"
+                                        color: geoRow.active ? Theme.accent : "transparent"
                                     }
 
                                     HoverHandler { id: geoHover }
@@ -971,27 +645,27 @@ ApplicationWindow {
 
                                     RowLayout {
                                         anchors.fill: parent
-                                        anchors.leftMargin: s3
-                                        anchors.rightMargin: s3
-                                        spacing: s3
+                                        anchors.leftMargin: Theme.s3
+                                        anchors.rightMargin: Theme.s3
+                                        spacing: Theme.s3
 
                                         T {
                                             text: modelData
-                                            color: geoRow.downloaded ? c.text : c.dim
+                                            color: geoRow.downloaded ? Theme.text : Theme.dim
                                             Layout.fillWidth: true
                                         }
 
                                         Tag {
                                             visible: geoRow.active
                                             text: "active"
-                                            accent: c.accent
+                                            accent: Theme.accent
                                         }
 
                                         Btn {
                                             visible: geoRow.hov && !geoRow.downloaded
                                             icon: "\uE896"
                                             text: "Download"
-                                            accent: c.ok
+                                            accent: Theme.ok
                                             on: !backend.geoipBusy
                                             onClicked: root.geoipDlgSource = modelData
                                         }
@@ -1000,7 +674,7 @@ ApplicationWindow {
                                             visible: geoRow.hov && geoRow.downloaded && !geoRow.active
                                             icon: "\uE74D"
                                             text: "Delete"
-                                            accent: c.err
+                                            accent: Theme.err
                                             on: !backend.geoipBusy
                                             onClicked: backend.deleteGeoipSource(modelData)
                                         }
@@ -1009,19 +683,19 @@ ApplicationWindow {
                             }
                         }
 
-                        Rule { Layout.fillWidth: true; Layout.topMargin: s3; visible: backend.geoipAvailable }
+                        Rule { Layout.fillWidth: true; Layout.topMargin: Theme.s3; visible: backend.geoipAvailable }
 
                         // IP Lookup
                         ColumnLayout {
                             visible: backend.geoipAvailable
                             Layout.fillWidth: true
-                            Layout.margins: s4
-                            spacing: s2
+                            Layout.margins: Theme.s4
+                            spacing: Theme.s2
 
                             Bold { text: "IP Lookup" }
 
                             Row {
-                                spacing: s2
+                                spacing: Theme.s2
 
                                 Input {
                                     id: ipIn
@@ -1039,7 +713,7 @@ ApplicationWindow {
                                 visible: backend.lookupResult.length > 0
                                 text: backend.lookupResult
                                 textFormat: Text.RichText
-                                color: backend.lookupSuccess ? c.ok : c.err
+                                color: backend.lookupSuccess ? Theme.ok : Theme.err
                             }
                         }
 
@@ -1048,35 +722,35 @@ ApplicationWindow {
                         Rectangle {
                             Layout.fillWidth: true
                             visible: backend.geoipInstalled.length > 0 || backend.geoipBusy
-                            height: visible ? metaCol.height + s4 * 2 : 0
-                            color: c.fg
+                            height: visible ? metaCol.height + Theme.s4 * 2 : 0
+                            color: Theme.fg
 
                             Rule { anchors.top: parent.top }
 
                             RowLayout {
                                 anchors.fill: parent
-                                anchors.margins: s4
-                                spacing: s4
+                                anchors.margins: Theme.s4
+                                spacing: Theme.s4
 
                                 Column {
                                     id: metaCol
                                     Layout.fillWidth: true
-                                    spacing: s1
+                                    spacing: Theme.s1
 
                                     Row {
-                                        spacing: s2
+                                        spacing: Theme.s2
                                         Muted { text: "Path:" }
                                         T { text: backend.geoipPath }
                                     }
 
                                     Row {
-                                        spacing: s2
+                                        spacing: Theme.s2
                                         Muted { text: "Size:" }
                                         T { text: backend.geoipSize }
                                     }
 
                                     Row {
-                                        spacing: s2
+                                        spacing: Theme.s2
                                         Muted { text: "Downloaded:" }
                                         T { text: backend.geoipMtime }
                                     }
@@ -1084,31 +758,31 @@ ApplicationWindow {
 
                                 Btn {
                                     icon: "\uE72C"
-                                    accent: c.accent
+                                    accent: Theme.accent
                                     on: !backend.geoipBusy && backend.geoipInstalled.length > 0
                                     onClicked: backend.refreshGeoip()
                                 }
 
                                 Btn {
                                     icon: "\uE838"
-                                    accent: c.text
+                                    accent: Theme.text
                                     on: backend.geoipInstalled.length > 0
                                     onClicked: backend.openGeoipFolder()
                                 }
 
                                 Btn {
                                     icon: "\uE74D"
-                                    accent: c.err
+                                    accent: Theme.err
                                     on: !backend.geoipBusy && backend.geoipInstalled.length > 0
                                     onClicked: backend.deleteGeoipData()
                                 }
                             }
                         }
 
-                        ProgressBar {
+                        Progress {
                             Layout.fillWidth: true
                             visible: backend.geoipBusy
-                            height: s2
+                            height: Theme.s2
                             radius: 0
                             value: backend.geoipProgress
                             active: backend.geoipBusy
@@ -1132,21 +806,21 @@ ApplicationWindow {
                     Rectangle {
                         visible: root.geoipDlgSource !== ""
                         anchors.centerIn: parent
-                        width: Math.round(320 * scale)
-                        height: Math.round(140 * scale)
-                        color: c.fg
-                        border.color: c.border
-                        radius: s2
+                        width: Math.round(320 * Theme.scale)
+                        height: Math.round(140 * Theme.scale)
+                        color: Theme.fg
+                        border.color: Theme.border
+                        radius: Theme.s2
                         z: 101
 
                         ColumnLayout {
                             anchors.fill: parent
-                            anchors.margins: s4
-                            spacing: s3
+                            anchors.margins: Theme.s4
+                            spacing: Theme.s3
 
                             Bold {
                                 text: "Download GeoIP Database"
-                                font.pixelSize: textMd
+                                font.pixelSize: Theme.textMd
                             }
 
                             T {
@@ -1159,7 +833,7 @@ ApplicationWindow {
 
                             Row {
                                 Layout.alignment: Qt.AlignRight
-                                spacing: s2
+                                spacing: Theme.s2
 
                                 Btn {
                                     text: "Cancel"
@@ -1168,7 +842,7 @@ ApplicationWindow {
 
                                 Btn {
                                     text: "Download"
-                                    accent: c.ok
+                                    accent: Theme.ok
                                     onClicked: {
                                         backend.downloadGeoip(root.geoipDlgSource)
                                         root.geoipDlgSource = ""
@@ -1180,13 +854,13 @@ ApplicationWindow {
                 }
 
                 // Info
-                Panel {
+                Section {
                     title: "SYSTEM INFO"
 
                     GridLayout {
                         columns: 2
-                        columnSpacing: s4 * 2
-                        rowSpacing: s2
+                        columnSpacing: Theme.s4 * 2
+                        rowSpacing: Theme.s2
 
                         Muted { text: backend.activeBrowserLabel }
                         Bold { text: backend.activeBrowserText; color: backend.activeBrowserColor }
@@ -1208,7 +882,7 @@ ApplicationWindow {
 
                         Muted { text: "Website" }
                         T {
-                            text: "<a href='https://camoufox.com' style='color:" + c.accent + "'>camoufox.com</a>"
+                            text: "<a href='https://camoufox.com' style='color:" + Theme.accent + "'>camoufox.com</a>"
                             textFormat: Text.RichText
                             onLinkActivated: link => Qt.openUrlExternally(link)
                         }
@@ -1220,43 +894,43 @@ ApplicationWindow {
 
                     Row {
                         visible: debugMode
-                        spacing: s4
+                        spacing: Theme.s4
 
                         Row {
-                            spacing: s2
+                            spacing: Theme.s2
                             Muted { text: "Spoof OS"; anchors.verticalCenter: parent.verticalCenter }
                             Combo {
                                 model: backend.spoofOsOptions
                                 currentIndex: backend.spoofOsIndex
                                 onActivated: backend.setSpoofOs(currentIndex)
-                                implicitWidth: Math.round(90 * scale)
+                                implicitWidth: Math.round(90 * Theme.scale)
                             }
                         }
 
                         Row {
-                            spacing: s2
+                            spacing: Theme.s2
                             Muted { text: "Spoof Arch"; anchors.verticalCenter: parent.verticalCenter }
                             Combo {
                                 model: backend.spoofArchOptions
                                 currentIndex: backend.spoofArchIndex
                                 onActivated: backend.setSpoofArch(currentIndex)
-                                implicitWidth: Math.round(90 * scale)
+                                implicitWidth: Math.round(90 * Theme.scale)
                             }
                         }
 
                         Row {
-                            spacing: s2
+                            spacing: Theme.s2
                             Muted { text: "Lib Version"; anchors.verticalCenter: parent.verticalCenter }
                             Rectangle {
-                                width: Math.round(80 * scale)
-                                height: Math.round(24 * scale)
+                                width: Math.round(80 * Theme.scale)
+                                height: Math.round(24 * Theme.scale)
                                 color: "#1affffff"
-                                radius: Math.round(3 * scale)
+                                radius: Math.round(3 * Theme.scale)
                                 TextInput {
                                     anchors.fill: parent
-                                    anchors.margins: Math.round(4 * scale)
+                                    anchors.margins: Math.round(4 * Theme.scale)
                                     color: "#fff"
-                                    font.pixelSize: Math.round(11 * scale)
+                                    font.pixelSize: Math.round(11 * Theme.scale)
                                     text: backend.spoofLibVer
                                     verticalAlignment: TextInput.AlignVCenter
                                     clip: true
@@ -1280,7 +954,7 @@ ApplicationWindow {
 
                     Row {
                         visible: debugMode
-                        spacing: s3
+                        spacing: Theme.s3
 
                         Muted { text: "UI Scale"; anchors.verticalCenter: parent.verticalCenter }
 
@@ -1291,32 +965,32 @@ ApplicationWindow {
                             stepSize: 0.1
                             value: root.scale
                             onPressedChanged: if (!pressed) root.scale = value
-                            implicitWidth: Math.round(140 * scale)
-                            implicitHeight: row - s2
+                            implicitWidth: Math.round(140 * Theme.scale)
+                            implicitHeight: Theme.row - Theme.s2
 
                             background: Rectangle {
                                 x: scaleSlider.leftPadding
-                                y: scaleSlider.topPadding + scaleSlider.availableHeight / 2 - s1 / 2
+                                y: scaleSlider.topPadding + scaleSlider.availableHeight / 2 - Theme.s1 / 2
                                 width: scaleSlider.availableWidth
-                                height: s1
-                                radius: s1 / 2
-                                color: c.raised
+                                height: Theme.s1
+                                radius: Theme.s1 / 2
+                                color: Theme.raised
 
                                 Rectangle {
                                     width: scaleSlider.visualPosition * parent.width
-                                    height: s1
-                                    radius: s1 / 2
-                                    color: c.accent
+                                    height: Theme.s1
+                                    radius: Theme.s1 / 2
+                                    color: Theme.accent
                                 }
                             }
 
                             handle: Rectangle {
                                 x: scaleSlider.leftPadding + scaleSlider.visualPosition * (scaleSlider.availableWidth - width)
                                 y: scaleSlider.topPadding + scaleSlider.availableHeight / 2 - height / 2
-                                width: s4
-                                height: s4
-                                radius: s2
-                                color: scaleSlider.pressed ? c.accent : c.text
+                                width: Theme.s4
+                                height: Theme.s4
+                                radius: Theme.s2
+                                color: scaleSlider.pressed ? Theme.accent : Theme.text
                             }
                         }
 
@@ -1326,7 +1000,7 @@ ApplicationWindow {
 
                 // Audit
                 Rectangle {
-                    color: c.bg
+                    color: Theme.bg
 
                     RowLayout {
                         anchors.fill: parent
@@ -1334,9 +1008,9 @@ ApplicationWindow {
 
                         // ---- left: configuration ----
                         Rectangle {
-                            Layout.preferredWidth: Math.round(330 * scale)
+                            Layout.preferredWidth: Math.round(330 * Theme.scale)
                             Layout.fillHeight: true
-                            color: c.bg
+                            color: Theme.bg
 
                             ColumnLayout {
                                 anchors.fill: parent
@@ -1344,12 +1018,12 @@ ApplicationWindow {
 
                                 Rectangle {
                                     Layout.fillWidth: true
-                                    height: row
-                                    color: c.fg
+                                    height: Theme.row
+                                    color: Theme.fg
                                     Rule { anchors.bottom: parent.bottom }
                                     Header {
                                         anchors.left: parent.left
-                                        anchors.leftMargin: s3
+                                        anchors.leftMargin: Theme.s3
                                         anchors.verticalCenter: parent.verticalCenter
                                         text: "AUDIT TARGET"
                                     }
@@ -1358,33 +1032,33 @@ ApplicationWindow {
                                 Flickable {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    contentHeight: cfgCol.implicitHeight + s4
+                                    contentHeight: cfgCol.implicitHeight + Theme.s4
                                     clip: true
                                     boundsBehavior: Flickable.StopAtBounds
 
                                     ColumnLayout {
                                         id: cfgCol
                                         width: parent.width
-                                        spacing: s2
-                                        anchors.margins: s3
+                                        spacing: Theme.s2
+                                        anchors.margins: Theme.s3
 
-                                        Item { Layout.preferredHeight: s1 }
+                                        Item { Layout.preferredHeight: Theme.s1 }
 
                                         Muted {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: "Only audit a site you own or have written permission to test."
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "TARGET URL"
                                         }
                                         Input {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             placeholder: "https://staging.example.com/"
                                             Component.onCompleted: text = auditBackend.target
@@ -1392,20 +1066,20 @@ ApplicationWindow {
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "AUTHORIZED HOSTS"
                                         }
                                         Input {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             placeholder: "example.com"
                                             Component.onCompleted: text = auditBackend.scopeHosts
                                             onTextChanged: auditBackend.setScopeHosts(text)
                                         }
                                         RowLayout {
-                                            Layout.leftMargin: s3
-                                            spacing: s2
+                                            Layout.leftMargin: Theme.s3
+                                            spacing: Theme.s2
                                             CheckBox {
                                                 id: subdomainsBox
                                                 text: "Include subdomains"
@@ -1415,19 +1089,19 @@ ApplicationWindow {
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "OUTBOUND FUNNEL (PROMOTIONAL BANNERS)"
                                         }
                                         Muted {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: "Follow promotional banners the audited page actually serves, and record click-through and landing-page engagement. Only banners pointing at hosts below (or already in scope) are ever followed."
                                         }
                                         RowLayout {
-                                            Layout.leftMargin: s3
-                                            spacing: s2
+                                            Layout.leftMargin: Theme.s3
+                                            spacing: Theme.s2
                                             CheckBox {
                                                 id: funnelBox
                                                 text: "Audit banner click-throughs"
@@ -1436,8 +1110,8 @@ ApplicationWindow {
                                             }
                                         }
                                         RowLayout {
-                                            Layout.leftMargin: s3
-                                            spacing: s2
+                                            Layout.leftMargin: Theme.s3
+                                            spacing: Theme.s2
                                             visible: auditBackend.enableOutboundFunnel
                                             CheckBox {
                                                 id: iframeBox
@@ -1447,21 +1121,21 @@ ApplicationWindow {
                                             }
                                         }
                                         Muted {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             visible: auditBackend.enableOutboundFunnel && !auditBackend.includeIframes
                                             text: "Main document only. Campaigns served from an ad iframe will not be discovered, and the funnel may report no banner on a page that is showing one."
                                         }
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "PARTNER CAMPAIGN HOSTS"
                                             visible: auditBackend.enableOutboundFunnel
                                         }
                                         Input {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             visible: auditBackend.enableOutboundFunnel
                                             placeholder: "partner.example.net (optional)"
@@ -1469,13 +1143,13 @@ ApplicationWindow {
                                             onTextChanged: auditBackend.setOutboundHosts(text)
                                         }
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "CAMPAIGN INTERACTION RATE (%)"
                                             visible: auditBackend.enableOutboundFunnel
                                         }
                                         Input {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             visible: auditBackend.enableOutboundFunnel
                                             placeholder: "2.5"
@@ -1485,13 +1159,13 @@ ApplicationWindow {
 
                                         // Authorization gate
                                         Rectangle {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
-                                            implicitHeight: ackCol.implicitHeight + s3 * 2
+                                            implicitHeight: ackCol.implicitHeight + Theme.s3 * 2
                                             color: auditBackend.acknowledged ? "#1e2a1e" : "#2a1e1e"
-                                            radius: s1
-                                            border.color: auditBackend.acknowledged ? c.ok : c.err
+                                            radius: Theme.s1
+                                            border.color: auditBackend.acknowledged ? Theme.ok : Theme.err
                                             border.width: 1
 
                                             ColumnLayout {
@@ -1499,8 +1173,8 @@ ApplicationWindow {
                                                 anchors.left: parent.left
                                                 anchors.right: parent.right
                                                 anchors.verticalCenter: parent.verticalCenter
-                                                anchors.margins: s2
-                                                spacing: s1
+                                                anchors.margins: Theme.s2
+                                                spacing: Theme.s1
 
                                                 CheckBox {
                                                     id: ackBox
@@ -1518,23 +1192,23 @@ ApplicationWindow {
                                         }
 
                                         Rule {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "TRAFFIC PLAN"
                                         }
 
                                         GridLayout {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             columns: 2
-                                            columnSpacing: s2
-                                            rowSpacing: s1
+                                            columnSpacing: Theme.s2
+                                            rowSpacing: Theme.s1
 
                                             Muted { text: "Visitors" }
                                             Input {
@@ -1590,13 +1264,13 @@ ApplicationWindow {
 
                                         // Schedule preview
                                         Rectangle {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
-                                            implicitHeight: prevCol.implicitHeight + s3
-                                            color: c.fg
-                                            radius: s1
-                                            border.color: c.border
+                                            implicitHeight: prevCol.implicitHeight + Theme.s3
+                                            color: Theme.fg
+                                            radius: Theme.s1
+                                            border.color: Theme.border
                                             border.width: 1
 
                                             ColumnLayout {
@@ -1604,8 +1278,8 @@ ApplicationWindow {
                                                 anchors.left: parent.left
                                                 anchors.right: parent.right
                                                 anchors.verticalCenter: parent.verticalCenter
-                                                anchors.margins: s2
-                                                spacing: s1
+                                                anchors.margins: Theme.s2
+                                                spacing: Theme.s1
 
                                                 Header { text: "ARRIVAL PREVIEW" }
 
@@ -1614,10 +1288,10 @@ ApplicationWindow {
                                                     Repeater {
                                                         model: auditBackend.schedulePreview
                                                         Rectangle {
-                                                            width: Math.max(2, Math.round((prevCol.width - s4) / 24) - 2)
+                                                            width: Math.max(2, Math.round((prevCol.width - Theme.s4) / 24) - 2)
                                                             height: Math.max(3, Math.round(28 * (modelData / Math.max(1, auditBackend.maxPreview()))))
                                                             anchors.bottom: parent.bottom
-                                                            color: c.accent
+                                                            color: Theme.accent
                                                             opacity: 0.35 + 0.65 * (modelData / Math.max(1, auditBackend.maxPreview()))
                                                         }
                                                     }
@@ -1632,23 +1306,23 @@ ApplicationWindow {
                                         }
 
                                         Rule {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "PROXY"
                                         }
 
                                         GridLayout {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             columns: 2
-                                            columnSpacing: s2
-                                            rowSpacing: s1
+                                            columnSpacing: Theme.s2
+                                            rowSpacing: Theme.s1
 
                                             Muted { text: "Mode" }
                                             Combo {
@@ -1665,7 +1339,7 @@ ApplicationWindow {
                                             RowLayout {
                                                 visible: auditBackend.proxyModeIndex === 1
                                                 Layout.fillWidth: true
-                                                spacing: s1
+                                                spacing: Theme.s1
                                                 Input {
                                                     id: proxyFileInput
                                                     Layout.fillWidth: true
@@ -1679,7 +1353,7 @@ ApplicationWindow {
                                                         var r = auditBackend.browseProxyFile()
                                                         if (r.path) proxyFileInput.text = r.path
                                                         proxyStatus.text = r.message
-                                                        proxyStatus.color = r.ok ? c.ok : c.err
+                                                        proxyStatus.color = r.ok ? Theme.ok : Theme.err
                                                     }
                                                 }
                                                 Btn {
@@ -1687,7 +1361,7 @@ ApplicationWindow {
                                                     onClicked: {
                                                         var r = auditBackend.validateProxyFile(proxyFileInput.text)
                                                         proxyStatus.text = r.message
-                                                        proxyStatus.color = r.ok ? c.ok : c.err
+                                                        proxyStatus.color = r.ok ? Theme.ok : Theme.err
                                                     }
                                                 }
                                             }
@@ -1727,38 +1401,38 @@ ApplicationWindow {
 
                                         Muted {
                                             id: proxyStatus
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: ""
                                         }
 
                                         Rule {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                         }
 
                                         Header {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "SAFETY CEILINGS"
                                         }
                                         Muted {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: "The audit stops when a ceiling is reached, rather than continuing."
                                         }
 
                                         GridLayout {
-                                            Layout.leftMargin: s3
-                                            Layout.rightMargin: s3
+                                            Layout.leftMargin: Theme.s3
+                                            Layout.rightMargin: Theme.s3
                                             Layout.fillWidth: true
                                             columns: 2
-                                            columnSpacing: s2
-                                            rowSpacing: s1
+                                            columnSpacing: Theme.s2
+                                            rowSpacing: Theme.s1
 
                                             Muted { text: "Max requests" }
                                             Input {
@@ -1802,14 +1476,14 @@ ApplicationWindow {
                                         }
 
                                         CheckBox {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "Single-level mode (run one rung, skip L0 up to it)"
                                             checked: auditBackend.singleLevelMode
                                             onToggled: auditBackend.setSingleLevelMode(checked)
                                         }
 
                                         Muted {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: "Off (default): the ladder runs from L0 up to the max "
@@ -1821,14 +1495,14 @@ ApplicationWindow {
                                         }
 
                                         CheckBox {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             text: "Force headless for every level"
                                             checked: auditBackend.headless
                                             onToggled: auditBackend.setHeadless(checked)
                                         }
 
                                         Muted {
-                                            Layout.leftMargin: s3
+                                            Layout.leftMargin: Theme.s3
                                             Layout.fillWidth: true
                                             wrapMode: Text.WordWrap
                                             text: "Off (default): each level runs the posture it "
@@ -1839,7 +1513,7 @@ ApplicationWindow {
                                                   + "the levels above it. The run says so when it overrides."
                                         }
 
-                                        Item { Layout.preferredHeight: s2 }
+                                        Item { Layout.preferredHeight: Theme.s2 }
                                     }
                                 }
                             }
@@ -1849,7 +1523,7 @@ ApplicationWindow {
                         Rectangle {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            color: c.bg
+                            color: Theme.bg
 
                             ColumnLayout {
                                 anchors.fill: parent
@@ -1858,27 +1532,27 @@ ApplicationWindow {
                                 // Run bar
                                 Rectangle {
                                     Layout.fillWidth: true
-                                    height: row
-                                    color: c.fg
+                                    height: Theme.row
+                                    color: Theme.fg
                                     Rule { anchors.bottom: parent.bottom }
 
                                     RowLayout {
                                         anchors.fill: parent
-                                        anchors.leftMargin: s3
-                                        anchors.rightMargin: s3
-                                        spacing: s2
+                                        anchors.leftMargin: Theme.s3
+                                        anchors.rightMargin: Theme.s3
+                                        spacing: Theme.s2
 
                                         Btn {
                                             text: "Start audit"
                                             icon: "\uE768"
-                                            accent: auditBackend.canRun ? c.accent : c.muted
+                                            accent: auditBackend.canRun ? Theme.accent : Theme.muted
                                             on: auditBackend.canRun
                                             onClicked: auditBackend.start()
                                         }
 
                                         Btn {
                                             text: "Stop"
-                                            accent: c.err
+                                            accent: Theme.err
                                             on: auditBackend.running
                                             onClicked: auditBackend.stop()
                                         }
@@ -1894,14 +1568,14 @@ ApplicationWindow {
                                         T {
                                             visible: auditBackend.running
                                             text: "running..."
-                                            color: c.accent
+                                            color: Theme.accent
                                         }
 
                                         T {
                                             visible: auditBackend.error.length > 0
                                             text: auditBackend.error
-                                            color: c.err
-                                            Layout.maximumWidth: Math.round(320 * scale)
+                                            color: Theme.err
+                                            Layout.maximumWidth: Math.round(320 * Theme.scale)
                                             elide: Text.ElideRight
                                         }
                                     }
@@ -1912,16 +1586,16 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     visible: !!auditBackend.summary
                                              && auditBackend.summary.visits !== undefined
-                                    implicitHeight: sumRow.implicitHeight + s2
-                                    color: c.fg
+                                    implicitHeight: sumRow.implicitHeight + Theme.s2
+                                    color: Theme.fg
 
                                     RowLayout {
                                         id: sumRow
                                         anchors.left: parent.left
                                         anchors.right: parent.right
                                         anchors.verticalCenter: parent.verticalCenter
-                                        anchors.margins: s3
-                                        spacing: s4
+                                        anchors.margins: Theme.s3
+                                        spacing: Theme.s4
 
                                         T {
                                             text: "Visits: " + (auditBackend.summary.visits || 0)
@@ -1935,7 +1609,7 @@ ApplicationWindow {
                                         T {
                                             visible: auditBackend.summary.aborted === true
                                             text: "ABORTED"
-                                            color: c.err
+                                            color: Theme.err
                                         }
                                         Item { Layout.fillWidth: true }
                                     }
@@ -1946,17 +1620,17 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     visible: auditBackend.findings.length > 0
                                     implicitHeight: Math.min(
-                                        Math.round(150 * scale),
-                                        findCol.implicitHeight + s3)
-                                    color: c.bg
+                                        Math.round(150 * Theme.scale),
+                                        findCol.implicitHeight + Theme.s3)
+                                    color: Theme.bg
 
                                     ColumnLayout {
                                         id: findCol
                                         anchors.left: parent.left
                                         anchors.right: parent.right
                                         anchors.top: parent.top
-                                        anchors.margins: s3
-                                        spacing: s1
+                                        anchors.margins: Theme.s3
+                                        spacing: Theme.s1
 
                                         Header { text: "FINDINGS" }
 
@@ -1977,15 +1651,15 @@ ApplicationWindow {
                                     visible: !!auditBackend.summary
                                              && !!auditBackend.summary.levels
                                              && auditBackend.summary.levels.length > 0
-                                    implicitHeight: lvlRow.implicitHeight + s3
-                                    color: c.fg
+                                    implicitHeight: lvlRow.implicitHeight + Theme.s3
+                                    color: Theme.fg
 
                                     Row {
                                         id: lvlRow
                                         anchors.left: parent.left
                                         anchors.verticalCenter: parent.verticalCenter
-                                        anchors.leftMargin: s3
-                                        spacing: s4
+                                        anchors.leftMargin: Theme.s3
+                                        spacing: Theme.s4
 
                                         Repeater {
                                             model: auditBackend.summary.levels || []
@@ -1999,7 +1673,7 @@ ApplicationWindow {
                                                 Muted {
                                                     visible: !!modelData.vendors
                                                     text: modelData.vendors
-                                                    color: c.accent
+                                                    color: Theme.accent
                                                 }
                                             }
                                         }
@@ -2010,49 +1684,55 @@ ApplicationWindow {
                                 // measured click-throughs, so an ordinary audit
                                 // does not grow an empty panel.
                                 Rectangle {
+                                    id: funnelCard
                                     Layout.fillWidth: true
-                                    Layout.preferredHeight: funnelCol.implicitHeight + s3 * 2
-                                    visible: !!auditBackend.summary
-                                             && !!auditBackend.summary.funnel
-                                             && auditBackend.summary.funnel.enabled === true
-                                    color: c.bg
-                                    border.color: c.muted
+                                    Layout.preferredHeight: funnelCol.implicitHeight + Theme.s3 * 2
+                                    //: The funnel key is absent from a run that did
+                                    //: not measure click-throughs, and reading
+                                    //: through it warns on every summary refresh.
+                                    //: Resolve it once, here.
+                                    readonly property var f: auditBackend.summary
+                                                             && auditBackend.summary.funnel
+                                                             ? auditBackend.summary.funnel : ({})
+                                    visible: f.enabled === true
+                                    color: Theme.bg
+                                    border.color: Theme.muted
                                     border.width: 1
-                                    radius: s1
+                                    radius: Theme.s1
 
                                     ColumnLayout {
                                         id: funnelCol
                                         anchors.left: parent.left
                                         anchors.right: parent.right
                                         anchors.top: parent.top
-                                        anchors.margins: s3
-                                        spacing: s1
+                                        anchors.margins: Theme.s3
+                                        spacing: Theme.s1
 
                                         T {
                                             text: "Outbound funnel"
-                                            color: c.accent
+                                            color: Theme.accent
                                         }
                                         Muted {
-                                            text: "Interaction rate " + (auditBackend.summary.funnel.ratePct || 0)
-                                                  + "%  clicks " + (auditBackend.summary.funnel.clicks || 0)
-                                                  + "  landed " + (auditBackend.summary.funnel.landed || 0)
-                                                  + "  engaged " + (auditBackend.summary.funnel.engaged || 0)
+                                            text: "Interaction rate " + (funnelCard.f.ratePct || 0)
+                                                  + "%  clicks " + (funnelCard.f.clicks || 0)
+                                                  + "  landed " + (funnelCard.f.landed || 0)
+                                                  + "  engaged " + (funnelCard.f.engaged || 0)
                                         }
                                         Muted {
-                                            text: "First-party " + (auditBackend.summary.funnel.firstPartyClicks || 0)
-                                                  + "  partner " + (auditBackend.summary.funnel.partnerClicks || 0)
-                                                  + "  refused " + (auditBackend.summary.funnel.refused || 0)
-                                                  + "  unreachable " + (auditBackend.summary.funnel.unreachable || 0)
+                                            text: "First-party " + (funnelCard.f.firstPartyClicks || 0)
+                                                  + "  partner " + (funnelCard.f.partnerClicks || 0)
+                                                  + "  refused " + (funnelCard.f.refused || 0)
+                                                  + "  unreachable " + (funnelCard.f.unreachable || 0)
                                         }
                                         Muted {
-                                            visible: auditBackend.summary.funnel.dwellP50 !== undefined
-                                                     && auditBackend.summary.funnel.dwellP50 !== null
-                                            text: "Dwell p50 " + (auditBackend.summary.funnel.dwellP50 || 0) + "s "
-                                                  + "(min " + (auditBackend.summary.funnel.dwellMin || 0) + "s, "
-                                                  + "max " + (auditBackend.summary.funnel.dwellMax || 0) + "s)"
+                                            visible: funnelCard.f.dwellP50 !== undefined
+                                                     && funnelCard.f.dwellP50 !== null
+                                            text: "Dwell p50 " + (funnelCard.f.dwellP50 || 0) + "s "
+                                                  + "(min " + (funnelCard.f.dwellMin || 0) + "s, "
+                                                  + "max " + (funnelCard.f.dwellMax || 0) + "s)"
                                         }
                                         Repeater {
-                                            model: auditBackend.summary.funnel.destinations || []
+                                            model: funnelCard.f.destinations || []
                                             delegate: Muted {
                                                 required property var modelData
                                                 text: "→ " + modelData.url + "  (" + modelData.clicks + " click"
@@ -2068,13 +1748,13 @@ ApplicationWindow {
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    color: c.bg
+                                    color: Theme.bg
                                     clip: true
 
                                     ListView {
                                         id: visitList
                                         anchors.fill: parent
-                                        anchors.margins: s2
+                                        anchors.margins: Theme.s2
                                         clip: true
                                         model: auditBackend.visits
                                         boundsBehavior: Flickable.StopAtBounds
@@ -2095,39 +1775,39 @@ ApplicationWindow {
                                             required property string proxyLabel
 
                                             width: visitList.width
-                                            height: row
-                                            color: index % 2 ? c.fg : "transparent"
+                                            height: Theme.row
+                                            color: index % 2 ? Theme.fg : "transparent"
 
                                             RowLayout {
                                                 anchors.fill: parent
-                                                anchors.leftMargin: s2
-                                                anchors.rightMargin: s2
-                                                spacing: s2
+                                                anchors.leftMargin: Theme.s2
+                                                anchors.rightMargin: Theme.s2
+                                                spacing: Theme.s2
 
                                                 T {
                                                     text: "#" + visitorIndex
-                                                    Layout.preferredWidth: Math.round(50 * scale)
-                                                    color: c.muted
+                                                    Layout.preferredWidth: Math.round(50 * Theme.scale)
+                                                    color: Theme.muted
                                                 }
                                                 T {
                                                     text: levelName
-                                                    Layout.preferredWidth: Math.round(150 * scale)
+                                                    Layout.preferredWidth: Math.round(150 * Theme.scale)
                                                     elide: Text.ElideRight
                                                 }
                                                 T {
                                                     text: verdict
                                                     color: verdictColor
-                                                    Layout.preferredWidth: Math.round(90 * scale)
+                                                    Layout.preferredWidth: Math.round(90 * Theme.scale)
                                                 }
                                                 T {
                                                     text: httpStatus
-                                                    Layout.preferredWidth: Math.round(40 * scale)
-                                                    color: c.muted
+                                                    Layout.preferredWidth: Math.round(40 * Theme.scale)
+                                                    color: Theme.muted
                                                 }
                                                 T {
                                                     text: source
-                                                    Layout.preferredWidth: Math.round(60 * scale)
-                                                    color: c.dim
+                                                    Layout.preferredWidth: Math.round(60 * Theme.scale)
+                                                    color: Theme.dim
                                                 }
                                                 Muted {
                                                     Layout.fillWidth: true
@@ -2142,13 +1822,13 @@ ApplicationWindow {
                                 // Log
                                 Rectangle {
                                     Layout.fillWidth: true
-                                    implicitHeight: Math.round(96 * scale)
-                                    color: c.fg
+                                    implicitHeight: Math.round(96 * Theme.scale)
+                                    color: Theme.fg
                                     Rule { anchors.top: parent.top }
 
                                     ColumnLayout {
                                         anchors.fill: parent
-                                        anchors.margins: s2
+                                        anchors.margins: Theme.s2
                                         spacing: 0
 
                                         Header { text: "LOG" }
@@ -2186,16 +1866,16 @@ ApplicationWindow {
         Rectangle {
             visible: tabs.currentIndex === 0
             Layout.fillWidth: true
-            height: row
-            color: c.fg
+            height: Theme.row
+            color: Theme.fg
 
             Rule { anchors.top: parent.top }
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: s3
-                anchors.rightMargin: s3
-                spacing: s2
+                anchors.leftMargin: Theme.s3
+                anchors.rightMargin: Theme.s3
+                spacing: Theme.s2
 
                 Btn {
                     visible: debugMode
@@ -2207,7 +1887,7 @@ ApplicationWindow {
                 Btn {
                     icon: "\uE895"
                     text: "Sync Repos"
-                    accent: c.accent
+                    accent: Theme.accent
                     on: !backend.busy
                     onClicked: backend.sync()
                 }
@@ -2223,16 +1903,16 @@ ApplicationWindow {
                     visible: backend.statusText.length > 0
                     text: backend.statusText
                     color: backend.statusColor
-                    Layout.maximumWidth: Math.round(200 * scale)
+                    Layout.maximumWidth: Math.round(200 * Theme.scale)
                     elide: Text.ElideRight
                 }
 
                 Row {
                     visible: backend.busy
-                    spacing: s2
+                    spacing: Theme.s2
 
-                    ProgressBar {
-                        width: Math.round(80 * scale)
+                    Progress {
+                        width: Math.round(80 * Theme.scale)
                         value: backend.progress
                         active: backend.busy
                         anchors.verticalCenter: parent.verticalCenter
@@ -2240,7 +1920,7 @@ ApplicationWindow {
 
                     Btn {
                         text: "Cancel"
-                        accent: c.err
+                        accent: Theme.err
                         onClicked: backend.cancelOperation()
                     }
                 }
@@ -2248,8 +1928,8 @@ ApplicationWindow {
                 T {
                     visible: backend.activeLabel.length > 0
                     text: backend.activeLabel
-                    color: c.accent
-                    Layout.maximumWidth: Math.round(200 * scale)
+                    color: Theme.accent
+                    Layout.maximumWidth: Math.round(200 * Theme.scale)
                     elide: Text.ElideRight
                 }
             }
