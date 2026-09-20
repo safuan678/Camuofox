@@ -23,14 +23,25 @@ import pytest
 # Make `import camoufox` resolve to the in-tree pythonlib without an install.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from shutil import which  # noqa: E402
+
 from camoufox.virtdisplay import VirtualDisplay  # noqa: E402
 
 DISPLAY_RE = re.compile(r"^:\d+$")
 N = int(os.environ.get("VIRTDISPLAY_TEST_N", "50"))
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="VirtualDisplay is Linux-only"
-)
+pytestmark = [
+    pytest.mark.skipif(
+        sys.platform != "linux", reason="VirtualDisplay is Linux-only"
+    ),
+    # A missing Xvfb is an environment gap, not a product defect. Reporting it as
+    # four failures sends a developer hunting for a bug that is not there; a skip
+    # that names the missing dependency is information. CI installs Xvfb, so it
+    # still runs them.
+    pytest.mark.skipif(
+        which("Xvfb") is None, reason="Xvfb is not installed on this host"
+    ),
+]
 
 
 # Track every VirtualDisplay we spawn so the fixture can guarantee

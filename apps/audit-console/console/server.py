@@ -15,6 +15,7 @@ allow-list before use.
 
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import sys
@@ -25,7 +26,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .runs import AuditService, TargetNotAllowed, TooManyAudits
+from .runs import (
+    RATE_LIMIT_WINDOW_S,
+    AuditService,
+    TargetNotAllowed,
+    TooManyAudits,
+)
 
 UI_DIR = Path(__file__).resolve().parent / "ui"
 MAX_BODY_BYTES = 64 * 1024
@@ -74,8 +80,71 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
     service: AuditService  # set on the subclass by make_server
+    #: Optional shared token. When set, every API route except the two health
+    #: endpoints requires it. Empty means "no auth", which is only safe because
+    #: the default bind is loopback -- see `make_server`.
+    auth_token: str = ""
+    #: Origins permitted on state-changing requests. Empty means same-origin only.
+    allowed_origins: Tuple[str, ...] = ()
 
     # -- plumbing ----------------------------------------------------------
+
+    def _client_ip(self) -> str:
+        return (self.client_address or ("", 0))[0]
+
+    def _origin_allowed(self) -> bool:
+        """
+        Whether a state-changing request came from an origin we accept.
+
+        A browser sends `Origin` on every cross-origin POST and cannot forge it,
+        so requiring it -- when present -- to be one of ours is what stops a page
+        on another site from driving the console from a visitor's browser. A
+        request with no `Origin` at all is not a browser form submission; it is a
+        script or curl, which the token or the loopback bind already governs.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        if self.allowed_origins:
+            return origin in self.allowed_origins
+        host = self.headers.get("Host", "")
+        return origin in (f"http://{host}", f"https://{host}")
+
+    def _authorized(self) -> bool:
+        if not self.auth_token:
+            return True
+        header = self.headers.get("Authorization", "")
+        scheme, _, presented = header.partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(
+            presented.strip(), self.auth_token
+        )
+
+    def _guard(self, rate_key: Optional[str]) -> bool:
+        """
+        Apply the token, Origin, and rate checks. True means "carry on".
+
+        Responses are sent here rather than raised so every route keeps a single,
+        obvious refusal shape.
+        """
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path in ("/", "/api/health", "/api/health/ready") or not path.startswith("/api"):
+            return True
+        if not self._authorized():
+            self._send(
+                *_json_bytes({"error": "unauthorized"}, 401),
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+            return False
+        if self.command == "POST" and not self._origin_allowed():
+            self._send(*_json_bytes({"error": "cross-origin request refused"}, 403))
+            return False
+        if rate_key and not self.service.note_request(self._client_ip(), rate_key):
+            self._send(
+                *_json_bytes({"error": "rate limit exceeded"}, 429),
+                extra_headers={"Retry-After": str(int(RATE_LIMIT_WINDOW_S))},
+            )
+            return False
+        return True
 
     def _send(
         self,
@@ -121,6 +190,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
 
+        if not self._guard(None):
+            return
+
         if path == "/":
             return self._serve_ui("index.html")
         # Any bare filename is served from the UI directory. read_ui_asset accepts
@@ -145,12 +217,28 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     }
                 )
             )
+        # Liveness above, readiness here. A probe that only reads liveness routes
+        # traffic to a console whose slots are all held; this one answers what a
+        # load balancer actually needs to know. Both stay unauthenticated -- a
+        # probe cannot present a credential -- and neither names a target beyond
+        # what the allow-list already is.
+        if path == "/api/health/ready":
+            state = self.service.readiness()
+            status = 200 if state["ready"] else 503
+            if not state["ready"]:
+                return self._send(
+                    *_json_bytes(state, status),
+                    extra_headers={"Retry-After": "15"},
+                )
+            return self._send(*_json_bytes(state, status))
         if path.startswith("/api/audits/"):
             return self._audit_route(path, query)
         return self._send(*_json_bytes({"error": "not found"}, 404))
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path.rstrip("/")
+        if not self._guard(path):
+            return
         if path == "/api/audits":
             return self._start_audit()
         if path == "/api/proxy":
@@ -271,17 +359,42 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    host: str, port: int, service: AuditService
+    host: str,
+    port: int,
+    service: AuditService,
+    auth_token: str = "",
+    allowed_origins: Tuple[str, ...] = (),
 ) -> ThreadingHTTPServer:
-    """A server bound to `host:port`, wired to `service`."""
-    handler = type("BoundConsoleHandler", (ConsoleHandler,), {"service": service})
+    """
+    A server bound to `host:port`, wired to `service`.
+
+    `auth_token` and `allowed_origins` are attached to the handler class rather
+    than to the service because they are properties of the HTTP surface, not of
+    the audit logic -- the same service can be served by a trusted front end with
+    a token and by a loopback-only instance without one.
+    """
+    handler = type(
+        "BoundConsoleHandler",
+        (ConsoleHandler,),
+        {
+            "service": service,
+            "auth_token": auth_token,
+            "allowed_origins": tuple(allowed_origins),
+        },
+    )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
 
 
-def serve(host: str, port: int, service: AuditService) -> None:
-    server = make_server(host, port, service)
+def serve(
+    host: str,
+    port: int,
+    service: AuditService,
+    auth_token: str = "",
+    allowed_origins: Tuple[str, ...] = (),
+) -> None:
+    server = make_server(host, port, service, auth_token, allowed_origins)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

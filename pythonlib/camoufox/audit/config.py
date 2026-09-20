@@ -495,6 +495,9 @@ class LevelResult:
     finished_at: float = 0.0
     aborted: bool = False
     abort_reason: str = ""
+    #: Paths of the screenshots and HTML captured for this rung, when
+    #: `AuditConfig.artifact_dir` is set. Empty when capture is off.
+    artifacts: List[str] = field(default_factory=list)
 
     def counts(self) -> Dict[str, int]:
         out: Dict[str, int] = {v: 0 for v in Verdict.ALL}
@@ -576,6 +579,7 @@ class LevelResult:
             "campaign_dwell_p50": self.campaign_dwell_p50(),
             "aborted": self.aborted,
             "abort_reason": self.abort_reason,
+            "artifacts": list(self.artifacts),
             "duration_s": round(max(0.0, self.finished_at - self.started_at), 2),
             "visits": [v.to_dict() for v in self.visits],
         }

@@ -269,6 +269,94 @@ Item {
                                 Component.onCompleted: text = auditBackend.seed
                                 onTextChanged: auditBackend.setSeed(text)
                             }
+
+                            Muted { text: "Cooldown between levels (s)" }
+                            Input {
+                                Layout.fillWidth: true
+                                text: auditBackend.cooldownSeconds
+                                input.validator: DoubleValidator { bottom: 0; top: 86400 }
+                                onEditingFinished: if (text.length) auditBackend.setCooldownSeconds(parseFloat(text))
+                            }
+
+                            Muted { text: "Max requests / visitor" }
+                            Input {
+                                Layout.fillWidth: true
+                                text: auditBackend.maxRequestsPerVisitor
+                                input.validator: IntValidator { bottom: 1; top: 10000 }
+                                onEditingFinished: if (text.length) auditBackend.setMaxRequestsPerVisitor(parseInt(text))
+                            }
+                        }
+
+                        Header {
+                            Layout.leftMargin: Theme.s3
+                            text: "EXTRA PATHS"
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: "One in-scope path per line, sampled alongside the target URL, e.g. /pricing. The root is always visited."
+                        }
+                        Input {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            placeholder: "/pricing"
+                            Component.onCompleted: text = auditBackend.extraPaths
+                            onTextChanged: auditBackend.setExtraPaths(text)
+                        }
+
+                        Header {
+                            Layout.leftMargin: Theme.s3
+                            text: "CUSTOM HEADERS"
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: "One 'Name: value' per line, sent on every request. Use this to audit a surface behind a login with a session cookie or token you already hold. A malformed line stops the run rather than being dropped."
+                        }
+                        TextArea {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            placeholder: "Cookie: session=...\nAuthorization: Bearer ..."
+                            Component.onCompleted: text = auditBackend.extraHeaders
+                            onTextChanged: auditBackend.setExtraHeaders(text)
+                        }
+
+                        Header {
+                            Layout.leftMargin: Theme.s3
+                            text: "EVIDENCE ARTIFACTS"
+                        }
+                        RowLayout {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            spacing: Theme.s1
+                            Input {
+                                id: artifactInput
+                                Layout.fillWidth: true
+                                placeholder: "(off) screenshots + HTML per level"
+                                Component.onCompleted: text = auditBackend.artifactDir
+                                onTextChanged: auditBackend.setArtifactDir(text)
+                            }
+                            Btn {
+                                text: "Browse"
+                                onClicked: {
+                                    var r = auditBackend.browseArtifactDir()
+                                    if (r.path) artifactInput.text = r.path
+                                }
+                            }
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: "When set, the first visit of each level writes a screenshot and the served HTML. A block or challenge page is captured too, which is the page worth keeping."
                         }
 
                         // Schedule preview
@@ -482,6 +570,45 @@ Item {
                                 Component.onCompleted: text = auditBackend.outDir
                                 onTextChanged: auditBackend.setOutDir(text)
                             }
+
+                            Muted { text: "Abort after N errors" }
+                            Input {
+                                Layout.fillWidth: true
+                                text: auditBackend.abortAfterErrors
+                                input.validator: IntValidator { bottom: 0; top: 100000 }
+                                onEditingFinished: if (text.length) auditBackend.setAbortAfterErrors(parseInt(text))
+                            }
+                        }
+
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: "A rung aborts after this many consecutive transport "
+                                  + "errors. 0 disables the ceiling. Keep it above a "
+                                  + "handful: a handful of timeouts is normal, and an "
+                                  + "abort turns a partial rung into no verdict at all."
+                        }
+
+                        CheckBox {
+                            Layout.leftMargin: Theme.s3
+                            text: "Reuse one browser per level"
+                            checked: auditBackend.reuseBrowser
+                            onToggled: auditBackend.setReuseBrowser(checked)
+                        }
+
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: "On (default): one browser serves a whole rung and "
+                                  + "each visitor opens its own context, which carries "
+                                  + "its own fingerprint. Off: a fresh browser launches "
+                                  + "per visit, so 100 visitors become 100 browser "
+                                  + "processes - far slower, and a resource shape no "
+                                  + "human population produces."
                         }
 
                         CheckBox {
