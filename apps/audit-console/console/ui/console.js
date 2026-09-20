@@ -7,6 +7,7 @@ const VERDICT_CLASS = {
   rate_limited: "rate_limited",
   blocked: "blocked",
   error: "error",
+  out_of_scope: "out_of_scope",
 };
 
 const VERDICT_LABEL = {
@@ -15,6 +16,20 @@ const VERDICT_LABEL = {
   rate_limited: "rate-limited",
   blocked: "blocked",
   error: "error",
+  out_of_scope: "refused by scope",
+};
+
+/* The bar segment colour per verdict. `rate_limited` borrows the challenge hue
+   and `out_of_scope` borrows the error hue: both are deliberate -- a rate limit
+   is a soft challenge, and a scope refusal is a diagnostic rather than an
+   outcome, so neither deserves a hue that reads as "the defense won". */
+const VERDICT_COLOR = {
+  allowed: "allow",
+  challenged: "challenge",
+  rate_limited: "challenge",
+  blocked: "block",
+  error: "error",
+  out_of_scope: "error",
 };
 
 const el = (id) => document.getElementById(id);
@@ -110,7 +125,7 @@ function renderRungs(levels) {
       if (!n) return;
       const span = document.createElement("span");
       span.style.width = (n / total) * 100 + "%";
-      span.style.background = `var(--${verdict === "rate_limited" ? "challenge" : verdict})`;
+      span.style.background = `var(--${VERDICT_COLOR[verdict] || "error"})`;
       span.title = `${VERDICT_LABEL[verdict]}: ${n}`;
       bar.append(span);
     });
@@ -148,7 +163,12 @@ function renderResult(session) {
   }
 
   el("stats").textContent =
-    `${summary.total_requests} requests · ${summary.total_visits} visits` +
+    `${summary.total_requests} requests ` +
+    `(${summary.navigations ?? 0} navigations, ${summary.subrequests ?? 0} subresources) · ` +
+    `${summary.total_visits} visits` +
+    (summary.blocked_hosts && summary.blocked_hosts.length
+      ? ` · ${summary.blocked_hosts.length} host(s) refused by scope`
+      : "") +
     (session.proxy && session.proxy.configured
       ? ` · ${session.proxy.count} proxy endpoint(s)`
       : " · no proxy");

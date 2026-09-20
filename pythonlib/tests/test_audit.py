@@ -1251,16 +1251,20 @@ def test_referer_is_sent_on_the_first_navigation_not_context_wide():
     code path was a bare `pass`), and the obvious fix -- putting it in the
     context's extra headers -- would stamp it on every CSS and image request,
     which is a synthetic tell rather than a human signal.
+
+    The stamping now lives in the scope guard (one route has to do both jobs), so
+    the check follows it there: the guard's stamp callback must key off
+    `is_navigation_request`, and the context-wide headers must stay referer-free.
     """
     import inspect
 
     from camoufox.audit import runner as runner_module
 
-    source = inspect.getsource(runner_module.AuditRunner._install_navigation_headers)
+    source = inspect.getsource(runner_module.AuditRunner._install_scope_guard)
     assert "is_navigation_request" in source, (
-        "the referer route must be limited to navigations"
+        "the arrival-header stamp must be limited to navigations"
     )
-    assert "referer" in source
+    assert "referer" in source.lower()
 
     # And the context-wide headers must not carry a referer.
     assert "referer" not in {h.lower() for h in level_by_id(5).context_headers}
@@ -1340,21 +1344,36 @@ def test_a_rung_never_stamps_its_headers_on_every_request():
 
 def test_the_arrival_route_does_not_outlive_the_first_navigation():
     """
-    The header route must detach after the arrival, or it eats the Referer.
+    The header stamp must apply to the arrival and nothing after it.
 
     The Referer is set for the arrival and then left alone: a browser derives the
     referer of every later navigation from the page it is leaving. A route that
     kept replacing the header set wholesale turned a natural link-follow into a
     bare request -- measured on the wire, every in-site hop arrived with
     `Referer: none`, which is a stronger bot signal than the one the route was
-    installed to avoid. The route therefore intercepts exactly one navigation and
-    unroutes itself.
+    installed to avoid.
+
+    The old design un-routed itself; the new one keeps one context-wide route and
+    makes the stamp single-shot instead, because un-routing it would take the
+    scope gate down with it. The invariant is the same either way: the stamping
+    callback fires once.
     """
     source = (Path(__file__).resolve().parents[1] / "camoufox/audit/runner.py").read_text()
-    start = source.index("async def _install_navigation_headers")
-    body = source[start : source.index("async def _drive_journey")]
-    assert "unroute" in body, "the arrival-header route never detaches"
-    assert "done = True" in body, "the arrival-header route has no single-shot guard"
+    guard = source[source.index("class _ScopeGuard") : source.index("def _normalize_scope_host")]
+    assert "if not self._stamped and self._stamp is not None:" in guard, (
+        "the stamp latch is never consulted; the stamp would fire on every navigation"
+    )
+    # The latch must be *set*, not only read, or every navigation is stamped.
+    assert "self._stamped = True" in guard, (
+        "the arrival-header stamp is checked but never latched"
+    )
+    # The stamp lives in the one context-wide route; installing a separate page
+    # route for it would take precedence and disable the scope guard underneath.
+    install = source[source.index("async def _install_scope_guard") : source.index("async def _drive_journey")]
+    assert "context.route" in install, "the guard is not installed on the context"
+    assert "page.route" not in install, (
+        "a page-level route takes precedence over the context guard and disables it"
+    )
 
 
 def test_the_hops_a_journey_makes_are_clicks_not_typed_urls():
@@ -2685,3 +2704,309 @@ def test_the_walk_selects_only_a_banner_the_scope_authorized():
     assert result.campaign is not None, "the 100% roll must select an authorized banner"
     assert urlparse(result.campaign.campaign_url).hostname == "shop.example.com"
     assert "undeclared.example.net" not in result.campaign.campaign_url
+
+
+# --------------------------------------------------------------------------
+# Scope containment: the gate must hold against redirects and subresources
+# --------------------------------------------------------------------------
+
+
+class _RedirectingWafHandler(BaseHTTPRequestHandler):
+    """
+    A target that tries to widen the audit's scope for it.
+
+    `/exit-redirect` bounces to an undeclared host; `/exit-subresource` serves a
+    document that pulls one asset from an undeclared host; `/in-redirect` bounces
+    within the declared host. The undeclared host counts its own hits, so a test
+    can assert the gate refused it *before* a request was sent rather than merely
+    recorded it.
+    """
+
+    protocol_version = "HTTP/1.1"
+    partner_hits = 0
+
+    def _send(self, status, body=b"", headers=None):
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        partner = os.environ["_PARTNER_BASE"]
+        if path == "/exit-redirect":
+            self._send(302, headers={"Location": partner + "/landed"})
+            return
+        if path == "/exit-subresource":
+            self._send(
+                200,
+                (
+                    "<html><head>"
+                    "<link rel=stylesheet href='/in-scope.css'>"
+                    f"<link rel=stylesheet href='{partner}/beacon.css'>"
+                    "</head><body>"
+                    f"<img src='{partner}/beacon.png'>"
+                    "<img src='/favicon.ico'>"
+                    "</body></html>"
+                ).encode(),
+            )
+            return
+        if path == "/in-scope.css":
+            self._send(200, b"body{}")
+            return
+        if path == "/landed":
+            self._send(200, b"<html>landed</html>")
+            return
+        self._send(200, b"<html>home</html>")
+
+    def log_message(self, *args):
+        pass
+
+
+class _PartnerHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        type(self).hits += 1
+        body = b"partner"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    _partners = None
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def redirect_waf_server():
+    """
+    A target plus an undeclared partner host, both on localhost.
+
+    The scope is host-based, so two ports on `127.0.0.1` would both be in scope and
+    the test could not tell a leak from a permitted request. The partner is
+    therefore addressed as `localhost` while the target is `127.0.0.1`: distinct
+    hostnames, same loopback interface, so only the target is declared.
+    """
+    partner = ThreadingHTTPServer(("127.0.0.1", 0), _PartnerHandler)
+    threading.Thread(target=partner.serve_forever, daemon=True).start()
+    _, p_port = partner.server_address
+    os.environ["_PARTNER_BASE"] = f"http://localhost:{p_port}"
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectingWafHandler)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+    t_host, t_port = target.server_address
+
+    yield {
+        "target": f"http://{t_host}:{t_port}/",
+        "partner": f"http://localhost:{p_port}",
+        "partner_handler": _PartnerHandler,
+    }
+    target.shutdown()
+    target.server_close()
+    partner.shutdown()
+    partner.server_close()
+
+
+def test_a_navigation_redirect_out_of_scope_is_refused_before_it_is_sent(
+    redirect_waf_server,
+):
+    """
+    The redirect hop must be judged, not followed.
+
+    Measured on this Playwright, a route handler sees only the first request of a
+    redirect chain: the hop the target redirects to never comes back through it.
+    So a gate that only inspected routed requests would let the target walk the
+    audit onto any host it liked. The guard decides from the URL, so an undeclared
+    destination is refused before a request is issued.
+    """
+    partner = redirect_waf_server["partner"]
+    scope = TargetScope.from_urls(
+        [redirect_waf_server["target"]], acknowledged=True
+    )
+    assert not scope.permits_url(partner + "/landed"), "partner must be out of scope"
+
+    from camoufox.audit.runner import _Limiter, _ScopeGuard
+
+    guard = _ScopeGuard(scope, limiter=_Limiter(0, 0))
+    assert guard._permits(redirect_waf_server["target"]) is True
+    assert guard._permits(partner + "/landed") is False
+
+    handler = redirect_waf_server["partner_handler"]
+    handler.hits = 0
+
+
+def test_the_partner_host_is_never_contacted_by_a_redirecting_target(
+    redirect_waf_server,
+):
+    """
+    End to end through the runner: a target that 302s off-site does not leak.
+
+    This is the regression for the reported bypass -- a redirect hop that route
+    interception never saw. The undeclared host must record zero hits, and the
+    run must not crash on the refused redirect.
+    """
+    partner_handler = redirect_waf_server["partner_handler"]
+    partner_handler.hits = 0
+
+    # Only the target is declared, so the redirect destination is out of scope.
+    scope = TargetScope.from_urls([redirect_waf_server["target"]], acknowledged=True)
+    config = AuditConfig(
+        target_url=redirect_waf_server["target"] + "exit-redirect",
+        scope=scope,
+        levels=[0],
+        visitor_count=1,
+        duration_hours=0.002,
+        cooldown_between_levels_s=0,
+        limits=SafetyLimits(max_requests=20, max_rps=50, max_concurrency=1),
+        seed=1,
+    )
+    report = asyncio.run(AuditRunner(config).run())
+
+    assert partner_handler.hits == 0, (
+        "the undeclared host was contacted; the redirect gate did not prevent the hop"
+    )
+    assert report.total_visits >= 1
+    visit = report.levels[0].visits[0]
+    # The refusal is a finding about the target's links, not a transport failure,
+    # so it must not be reported as "the audit could not reach the site".
+    assert visit.verdict == Verdict.OUT_OF_SCOPE, visit.verdict
+    assert "localhost" in visit.blocked_hosts
+
+
+def test_subresource_accounting_counts_what_really_left_the_host(
+    redirect_waf_server,
+):
+    """
+    A request ceiling must bound real traffic, not just navigations.
+
+    A browser page pulls a favicon and its assets; those reach the target and the
+    defenses log them. If the census counted only the navigations the runner
+    drives, the ceiling would be advisory and the reported traffic would be lower
+    than what the target observed.
+    """
+    scope = TargetScope.from_urls([redirect_waf_server["target"]], acknowledged=True)
+    # The page under test is the target URL itself, so the journey lands on the
+    # subresource-serving document deterministically rather than on a random path.
+    target = redirect_waf_server["target"] + "exit-subresource"
+    config = AuditConfig(
+        target_url=target,
+        scope=scope,
+        levels=[1],
+        visitor_count=1,
+        duration_hours=0.002,
+        cooldown_between_levels_s=0,
+        limits=SafetyLimits(max_requests=50, max_rps=50, max_concurrency=1),
+        seed=1,
+    )
+    # Browser rungs need Camoufox; skip cleanly when it cannot launch rather than
+    # pretending the path was exercised.
+    try:
+        report = asyncio.run(AuditRunner(config).run())
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"browser rung unavailable: {type(exc).__name__}: {exc}")
+
+    visits = [v for lr in report.levels for v in lr.visits]
+    if not visits or all(v.verdict == Verdict.ERROR for v in visits):
+        pytest.skip("browser rung could not run in this environment")
+
+    partner_handler = redirect_waf_server["partner_handler"]
+    assert partner_handler.hits == 0, (
+        "an out-of-scope subresource reached the undeclared host"
+    )
+    visit = visits[0]
+    assert visit.subrequests_made >= 1, (
+        "in-scope subresources (the favicon) were not counted in the census"
+    )
+    assert visit.total_requests == visit.requests_made + visit.subrequests_made
+
+
+def test_an_out_of_scope_verdict_is_not_counted_as_a_defense_win():
+    """
+    OUT_OF_SCOPE must not be read as BLOCKED or as a bypass.
+
+    The distinction is the point of the verdict: a gate refusal is a fact about the
+    site's links, not about the defense. Folding it into DETECTED would credit the
+    defense with the gate's work; folding it into ALLOWED would call an unfollowed
+    link a bypass.
+    """
+    assert Verdict.OUT_OF_SCOPE in Verdict.ALL
+    assert Verdict.OUT_OF_SCOPE not in Verdict.DETECTED
+
+    visit = VisitResult(
+        visitor_index=0,
+        level_id=0,
+        started_at=0.0,
+        verdict=Verdict.OUT_OF_SCOPE,
+    )
+    assert visit.detected is False
+    lr = LevelResult(level=level_by_id(0), visits=[visit])
+    assert lr.detected == 0
+    assert lr.allowed == 0
+    assert lr.counts()[Verdict.OUT_OF_SCOPE] == 1
+
+
+def test_the_report_says_how_many_requests_actually_left(
+    redirect_waf_server,
+):
+    """
+    The text report must break the census down rather than print one number.
+
+    The single number was the bug: it read as "requests sent" while counting only
+    navigations. The breakdown is what makes the rate-limit finding interpretable.
+    """
+    target = redirect_waf_server["target"]
+    scope = TargetScope.from_urls([target], acknowledged=True)
+    config = AuditConfig(
+        target_url=target,
+        scope=scope,
+        levels=[0],
+        visitor_count=2,
+        duration_hours=0.002,
+        cooldown_between_levels_s=0,
+        limits=SafetyLimits(max_requests=20, max_rps=50, max_concurrency=1),
+        seed=1,
+    )
+    report = asyncio.run(AuditRunner(config).run())
+    report.levels[0].visits[0].subrequests_made = 3
+
+    text = render_text(report)
+    assert "navigations" in text and "subresources" in text, (
+        "the report must break the request count into its two kinds"
+    )
+    assert report.total_requests == report.navigations + report.subrequests
+
+
+def test_a_blocked_host_appears_as_a_finding_not_as_detection():
+    """
+    A scope refusal is reported as a finding about the site, never as a block.
+
+    Constructed directly so it does not depend on a browser: a visit that recorded
+    a refused host must surface in the findings, and the finding must not claim the
+    defense stopped anything.
+    """
+    target = "http://localhost:1/"
+    scope = TargetScope.from_urls([target], acknowledged=True)
+    config = AuditConfig(target_url=target, scope=scope, levels=[0], visitor_count=1)
+    report = AuditReport(config=config)
+    visit = VisitResult(
+        visitor_index=0,
+        level_id=0,
+        started_at=0.0,
+        finished_at=1.0,
+        verdict=Verdict.ALLOWED,
+        blocked_hosts=["undeclared.example.net"],
+    )
+    report.levels.append(LevelResult(level=level_by_id(0), visits=[visit]))
+
+    findings = " ".join(build_findings(report))
+    assert "undeclared.example.net" in findings
+    assert "no request was sent" in findings.lower()

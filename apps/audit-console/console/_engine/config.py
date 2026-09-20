@@ -404,6 +404,16 @@ class VisitResult:
     reason: str = ""
     http_status: Optional[int] = None
     requests_made: int = 0
+    #: Requests the browser issued that `requests_made` does not count.
+    #:
+    #: A page load is not one request: the document pulls a favicon, stylesheets,
+    #: scripts and images, all of which reach the target and all of which the
+    #: defenses see. Counting only the navigations the runner drives understates
+    #: the traffic the audit actually sent -- and, worse, makes the request ceiling
+    #: advisory, because a browser rung sent 2x the number the report admits.
+    #: Held separately so the attributable figure (one per visit) stays readable
+    #: next to the true one.
+    subrequests_made: int = 0
     pages_loaded: int = 0
     source: str = ""
     referer: Optional[str] = None
@@ -415,10 +425,22 @@ class VisitResult:
     latencies: List[float] = field(default_factory=list)
     #: The funnel click-through that happened during this visit, if any.
     campaign: Optional[CampaignEvent] = None
+    #: Distinct hosts the scope gate refused during this visit, in first-seen order.
+    #:
+    #: The page under audit deciding to reference a host the operator never named
+    #: is a finding about the site, so it is recorded on the visit rather than only
+    #: logged. Distinct by host so a page pulling 50 assets from one undeclared CDN
+    #: reads as one destination, not fifty.
+    blocked_hosts: List[str] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
         return max(0.0, self.finished_at - self.started_at)
+
+    @property
+    def total_requests(self) -> int:
+        """Every request this visit caused, navigations plus subresources."""
+        return self.requests_made + self.subrequests_made
 
     @property
     def detected(self) -> bool:
@@ -442,6 +464,8 @@ class VisitResult:
             "reason": self.reason,
             "http_status": self.http_status,
             "requests_made": self.requests_made,
+            "subrequests_made": self.subrequests_made,
+            "total_requests": self.total_requests,
             "pages_loaded": self.pages_loaded,
             "duration_s": round(self.duration_s, 3),
             "source": self.source,
@@ -454,6 +478,7 @@ class VisitResult:
             "p50_latency": self.p50_latency,
             "p95_latency": self.p95_latency,
             "campaign": self.campaign.to_dict() if self.campaign else None,
+            "blocked_hosts": list(self.blocked_hosts),
         }
 
 
@@ -585,7 +610,29 @@ class AuditReport:
 
     @property
     def total_requests(self) -> int:
+        """Every request the audit caused, navigations plus subresources."""
+        return sum(v.total_requests for lr in self.levels for v in lr.visits)
+
+    @property
+    def navigations(self) -> int:
+        """Document requests only -- the visits and hops the runner drove."""
         return sum(v.requests_made for lr in self.levels for v in lr.visits)
+
+    @property
+    def subrequests(self) -> int:
+        """Requests the browser issued on its own: favicon, CSS, scripts, images."""
+        return sum(v.subrequests_made for lr in self.levels for v in lr.visits)
+
+    @property
+    def blocked_hosts(self) -> List[str]:
+        """Distinct hosts the scope gate refused, across the whole run."""
+        seen: List[str] = []
+        for lr in self.levels:
+            for visit in lr.visits:
+                for host in visit.blocked_hosts:
+                    if host not in seen:
+                        seen.append(host)
+        return seen
 
     def first_effective_level(self) -> Optional[LevelResult]:
         """
@@ -679,6 +726,9 @@ class AuditReport:
             "totals": {
                 "visits": self.total_visits,
                 "requests": self.total_requests,
+                "navigations": self.navigations,
+                "subrequests": self.subrequests,
+                "blocked_hosts": self.blocked_hosts,
             },
             "funnel": self.funnel_summary(),
             "levels": [lr.to_dict() for lr in self.levels],

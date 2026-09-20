@@ -48,6 +48,7 @@ _VERDICT_LABEL = {
     Verdict.RATE_LIMITED: "rate limited",
     Verdict.BLOCKED: "blocked",
     Verdict.ERROR: "error",
+    Verdict.OUT_OF_SCOPE: "refused by scope",
 }
 
 
@@ -160,8 +161,43 @@ def build_findings(report: AuditReport) -> List[str]:
     for warning in report.schedule_warnings:
         findings.append(f"Scheduling caveat: {warning}")
 
+    findings.extend(_scope_findings(report))
     findings.extend(_funnel_findings(report))
 
+    return findings
+
+
+def _scope_findings(report: AuditReport) -> List[str]:
+    """
+    What the scope gate refused, and how much traffic the audit really sent.
+
+    Both lines exist because the report used to be silent about them. A page that
+    points at a host the operator never authorized is a finding about the site,
+    and the gate's refusal is the reason that finding did not become a request to
+    a third party. And the request count is a claim about what left the host; if
+    it only counted navigations, it understated the traffic the defenses logged.
+    """
+    findings: List[str] = []
+    hosts = report.blocked_hosts
+    if hosts:
+        listed = ", ".join(hosts[:5])
+        more = f" (+{len(hosts) - 5} more)" if len(hosts) > 5 else ""
+        findings.append(
+            f"The scope gate refused {len(hosts)} undeclared host(s) that the pages "
+            f"referenced or redirected to: {listed}{more}. No request was sent to "
+            f"them. If these are expected partners, declare them in the outbound "
+            f"scope; if not, the pages are pointing traffic off-site."
+        )
+
+    subrequests = report.subrequests
+    if subrequests:
+        findings.append(
+            f"The target saw {report.total_requests} requests: "
+            f"{report.navigations} navigations the audit drove and {subrequests} "
+            f"subresources the browser issued on its own (stylesheets, scripts, "
+            f"images, favicon). Rate-limit findings should be read against the "
+            f"total, since the defense counts both."
+        )
     return findings
 
 
@@ -276,7 +312,12 @@ def render_text(report: AuditReport) -> str:
         selected = report.config.selected_levels()
         add(f"Mode        : ladder, L{selected[0].id}-L{selected[-1].id}")
     add(f"Duration    : {report.finished_at - report.started_at:.1f}s")
-    add(f"Requests    : {report.total_requests}")
+    add(f"Requests    : {report.total_requests} "
+        f"({report.navigations} navigations, {report.subrequests} subresources)")
+    if report.blocked_hosts:
+        add(f"Refused     : {len(report.blocked_hosts)} undeclared host(s) "
+            f"the scope gate blocked: {', '.join(report.blocked_hosts[:5])}"
+            + (f" (+{len(report.blocked_hosts) - 5} more)" if len(report.blocked_hosts) > 5 else ""))
     add("")
 
     add("-" * 72)
@@ -371,6 +412,8 @@ def write_csv(report: AuditReport, path: str) -> Path:
             "detected",
             "http_status",
             "requests",
+            "subrequests",
+            "total_requests",
             "pages",
             "duration_s",
             "source",
@@ -386,6 +429,7 @@ def write_csv(report: AuditReport, path: str) -> Path:
             "campaign_landed",
             "campaign_landing_status",
             "campaign_dwell_s",
+            "blocked_hosts",
         ]
     )
     for lr in report.levels:
@@ -400,6 +444,8 @@ def write_csv(report: AuditReport, path: str) -> Path:
                     visit.detected,
                     visit.http_status if visit.http_status is not None else "",
                     visit.requests_made,
+                    visit.subrequests_made,
+                    visit.total_requests,
                     visit.pages_loaded,
                     f"{visit.duration_s:.3f}",
                     visit.source,
@@ -415,6 +461,7 @@ def write_csv(report: AuditReport, path: str) -> Path:
                     campaign.landed if campaign else "",
                     campaign.landing_status if campaign and campaign.landing_status is not None else "",
                     f"{campaign.dwell_s:.3f}" if campaign else "",
+                    ";".join(visit.blocked_hosts),
                 ]
             )
     target.write_text(buffer.getvalue(), encoding="utf-8")
@@ -523,7 +570,8 @@ def render_html(report: AuditReport) -> str:
  <dt>Visitors scheduled</dt><dd>{report.config.visitor_count} over {report.config.duration_hours:g}h ({esc(report.config.pattern)})</dd>
  <dt>Mode</dt><dd>{("single rung, " + esc(report.config.selected_levels()[0].name)) if report.config.single_level_mode else "evasion ladder"}</dd>
  <dt>Visits completed</dt><dd>{report.total_visits}</dd>
- <dt>Requests sent</dt><dd>{report.total_requests}</dd>
+ <dt>Requests sent</dt><dd>{report.total_requests} ({report.navigations} navigations, {report.subrequests} subresources)</dd>
+ <dt>Hosts refused by scope</dt><dd>{len(report.blocked_hosts)}</dd>
  <dt>Wall duration</dt><dd>{report.finished_at - report.started_at:.1f}s</dd>
  {single_row}
 </dl></div>

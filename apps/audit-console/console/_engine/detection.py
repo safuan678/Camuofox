@@ -46,8 +46,17 @@ class Verdict:
     RATE_LIMITED = "rate_limited"
     BLOCKED = "blocked"
     ERROR = "error"
+    #: The audit's own scope gate refused the destination.
+    #:
+    #: Kept as a separate verdict rather than folded into BLOCKED because the two
+    #: are answers to different questions. BLOCKED is a finding about the target's
+    #: defense; this is a finding about the target's *links* -- the page pointed at
+    #: a host the operator never authorized, and the audit declined to follow it.
+    #: Reporting it as BLOCKED would credit the defense with work the gate did, and
+    #: reporting it as ALLOWED would call an unfollowed link a bypass.
+    OUT_OF_SCOPE = "out_of_scope"
 
-    ALL = (ALLOWED, CHALLENGED, RATE_LIMITED, BLOCKED, ERROR)
+    ALL = (ALLOWED, CHALLENGED, RATE_LIMITED, BLOCKED, ERROR, OUT_OF_SCOPE)
 
     #: A refusal is a *successful* audit outcome: the defense worked.
     DETECTED = (CHALLENGED, RATE_LIMITED, BLOCKED)

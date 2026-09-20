@@ -139,6 +139,9 @@ class AuditSession:
             levels.append(entry)
         return {
             "total_requests": report.total_requests,
+            "navigations": report.navigations,
+            "subrequests": report.subrequests,
+            "blocked_hosts": report.blocked_hosts,
             "total_visits": report.total_visits,
             "findings": build_findings(report),
             "first_effective_level": (

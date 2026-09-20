@@ -30,6 +30,7 @@ import os
 import random
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -57,33 +58,10 @@ class SafetyStop(RuntimeError):
 
 #: Headers the rung intends to send on its own navigation.
 #:
-#: Named here so the referer route knows which header names it may override and
-#: which user agents Camoufox already sets -- re-applying those would be the
-#: inconsistency the nav/context split exists to avoid.
+#: Named here so the scope guard's stamping step knows which header name carries
+#: the arrival referer, and which header names Camoufox already sets -- re-applying
+#: those would be the inconsistency the nav/context split exists to avoid.
 _REFERER_HEADER = "Referer"
-
-
-def _merge_navigation_headers(
-    existing: Optional[Dict[str, str]],
-    wanted: Dict[str, str],
-) -> Dict[str, str]:
-    """
-    Overlay the rung's navigation headers onto a request's own headers.
-
-    Preserves the browser's header order for everything it already sent (only the
-    names that are being overridden are replaced in place; new names are appended),
-    because a reordered navigation header set is itself a fingerprint.
-    """
-    merged: Dict[str, str] = dict(existing or {})
-    lowered = {k.lower(): k for k in merged}
-    for name, value in wanted.items():
-        key = lowered.get(name.lower())
-        if key is not None:
-            merged[key] = value
-        else:
-            merged[name] = value
-            lowered[name.lower()] = name
-    return merged
 
 
 class _OpenResult:
@@ -105,6 +83,286 @@ class _OpenResult:
         self.headers: Dict[str, str] = {}
         self.body: str = ""
         self.loaded: bool = False
+
+
+#: Status codes that mean "go here instead", not "here is the page".
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+class _ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    A urllib redirect handler that will not follow a redirect out of scope.
+
+    The browser rungs are contained by the route guard; the HTTP rung is not a
+    browser and has no routes, so it needs its own gate. urllib's default opener
+    follows a `Location:` to any host it names, which is the same leak the browser
+    path had: the target gets to choose what this tool talks to. This handler is
+    installed on the opener and refuses the redirect *before* the next request is
+    issued, so the out-of-scope host is never contacted.
+    """
+
+    def __init__(self, permit, blocked: Optional[List[str]] = None) -> None:
+        super().__init__()
+        self._permit = permit
+        self._blocked = blocked
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        if not self._permit(target):
+            if self._blocked is not None:
+                host = (urlparse(target).hostname or "").lower()
+                if host and host not in self._blocked:
+                    self._blocked.append(host)
+            raise ScopeViolation(f"redirect to {target!r} left the declared scope")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+class _ScopeGuard:
+    """
+    The single place a browser request is permitted to leave.
+
+    Why this exists
+    ---------------
+    The scope gate used to be consulted once, for the URL the runner had chosen,
+    and then the browser was left to route itself. That is not the same thing as
+    an enforced scope: the page under audit decides what its own subresources
+    point at, and the target decides where a response redirects. Both were
+    followed unexamined, so a page could pull assets from -- or redirect a visit
+    to -- a host the operator never named. An audit tool whose authorization
+    boundary can be widened by the thing being audited is not contained.
+
+    How it closes both holes
+    ------------------------
+    One context-level route handler sees every request. A request to an undeclared
+    host is aborted with no traffic sent -- the request never reaches a socket, so
+    the gate is preventive, not merely observational.
+
+    Redirects need different handling, because a redirect hop is *not* re-routed:
+    measured on the Playwright the audit drives, a route handler sees only the
+    first request of a chain (a redirect's second request never comes back through
+    it). So the handler resolves a navigation's chain itself, one hop at a time,
+    judging each destination against the scope before asking for it. The browser
+    is then served the final in-scope response and never speaks to the
+    out-of-scope host at all. The alternative -- letting the browser follow the
+    302 and aborting the request it makes -- is too late: the request has already
+    left, which is the thing the gate exists to prevent.
+
+    Subresources take the cheap path (`continue_()`), so the browser's own request
+    goes out untouched and the audit still measures the real client. Navigations
+    are resolved through `fetch()`, which costs some fidelity in Chromium -- it
+    drops `Sec-Fetch-*` -- but not in Firefox, which is the engine Camoufox
+    drives; verified against a real server, the headers the target sees are
+    identical. Fidelity is the product here, so it is checked rather than assumed.
+
+    Everything is counted: the guard tallies subresources so the request ceiling
+    accounts for the traffic that actually leaves, rather than only the
+    navigations the runner drives by hand.
+    """
+
+    def __init__(
+        self,
+        scope: TargetScope,
+        *,
+        limiter: "_Limiter",
+        on_block=None,
+        on_sent=None,
+        stamp=None,
+        max_hops: int = 10,
+    ) -> None:
+        self._scope = scope
+        self._limiter = limiter
+        self._on_block = on_block
+        self._on_sent = on_sent
+        self._stamp = stamp
+        self._max_hops = max_hops
+        #: Distinct refused hosts, in first-seen order, for the report.
+        self.blocked_hosts: List[str] = []
+        self._blocked_seen: set = set()
+        self._stamped = False
+
+    # -- decisions ---------------------------------------------------------
+
+    def _block(self, url: str, resource_type: str) -> None:
+        host = _normalize_scope_host(url)
+        if host and host not in self._blocked_seen:
+            self._blocked_seen.add(host)
+            self.blocked_hosts.append(host)
+        if self._on_block is not None:
+            try:
+                self._on_block(host, url, resource_type)
+            except Exception:
+                pass
+
+    def _sent(self, count: int = 1) -> None:
+        """Report requests that left, for the visit's traffic census."""
+        if self._on_sent is not None:
+            try:
+                self._on_sent(count)
+            except Exception:
+                pass
+
+    async def handle(self, route, request) -> None:
+        """
+        Judge one request.
+
+        A navigation is resolved hop by hop so a redirect cannot smuggle the
+        request past the gate; anything else is decided from its URL alone.
+        """
+        url = request.url
+        is_navigation = bool(request.is_navigation_request())
+        resource_type = getattr(request, "resource_type", "") or ""
+
+        if is_navigation:
+            await self._handle_navigation(route, request, url)
+            return
+
+        if not _is_web_url(url):
+            # A non-http(s) request (`about:blank`, `data:`, a `blob:`) is not
+            # traffic to a third party and is not the audit's to police.
+            await self._safe_continue(route)
+            return
+
+        if not self._permits(url):
+            self._block(url, resource_type)
+            await self._safe_abort(route)
+            return
+
+        # A subresource costs the target a request too, and it is exactly the
+        # traffic the ceiling was blind to. Charge the limiter here so the ceiling
+        # bounds what actually leaves; a ceiling reached mid-page then stops the
+        # page's remaining assets rather than only its navigations.
+        try:
+            await self._limiter.acquire()
+        except SafetyStop:
+            self._block(url, resource_type)
+            await self._safe_abort(route)
+            return
+        self._sent()
+        await self._safe_continue(route)
+
+    async def _handle_navigation(self, route, request, url: str) -> None:
+        if not _is_web_url(url):
+            await self._safe_continue(route)
+            return
+
+        if not self._permits(url):
+            self._block(url, resource_type="document")
+            await self._safe_abort(route)
+            return
+
+        headers = dict(request.headers or {})
+        if not self._stamped and self._stamp is not None:
+            extra = None
+            try:
+                extra = self._stamp(request)
+            except Exception:
+                extra = None
+            if extra:
+                headers.update(extra)
+                self._stamped = True
+
+        hop = url
+        first = True
+        try:
+            for _ in range(self._max_hops):
+                if not self._permits(hop):
+                    # The chain tried to leave the authorized scope. Nothing has
+                    # been sent to this host, and nothing will be.
+                    self._block(hop, resource_type="redirect")
+                    await self._safe_abort(route)
+                    return
+                # The runner acquires the limiter for the navigation it is about to
+                # make and counts it as a request itself; charging or counting
+                # this hop again would do both twice. Each later hop is a request
+                # the runner did not know about, so it is charged and counted here.
+                if first:
+                    first = False
+                else:
+                    try:
+                        await self._limiter.acquire()
+                    except SafetyStop:
+                        self._block(hop, resource_type="redirect")
+                        await self._safe_abort(route)
+                        return
+                    self._sent()
+                response = await route.fetch(
+                    url=hop, max_redirects=0, headers=headers
+                )
+                if response.status in _REDIRECT_STATUSES:
+                    location = response.headers.get("location")
+                    if not location:
+                        await route.fulfill(response=response)
+                        return
+                    hop = urljoin(str(response.url), location)
+                    continue
+                await route.fulfill(response=response)
+                return
+            # A chain longer than the cap is not something to follow blindly.
+            self._block(url, resource_type="redirect")
+            await self._safe_abort(route)
+        except SafetyStop:
+            await self._safe_abort(route)
+        except Exception:
+            # A request that cannot be resolved is a failure of this one
+            # navigation, not a reason to hang it: fail the request so the visit
+            # records an error rather than stalling the run.
+            await self._safe_abort(route)
+
+    def _permits(self, url: str) -> bool:
+        """
+        Whether this URL may be requested.
+
+        Two ways in, and both are operator-declared: the URL is inside the
+        authorized scope (which is what the target itself is), or it is one of the
+        operator's named outbound destinations. Nothing discovered at visit time
+        can widen this -- `_discover_banners` goes through the same gate, which is
+        why a hand-declared partner and a discovered banner are treated alike.
+
+        Note that `authorize_outbound` refuses IP-literal hosts outright (the
+        cloud metadata endpoint is a literal), so an IP-literal target is admitted
+        by the scope check, not by the outbound one. Using the outbound check alone
+        would refuse a legitimate IP-addressed target.
+        """
+        return _scope_permits(self._scope, url)
+
+    # -- route primitives --------------------------------------------------
+
+    @staticmethod
+    async def _safe_abort(route) -> None:
+        try:
+            await route.abort()
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _safe_continue(route) -> None:
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
+
+def _normalize_scope_host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_web_url(url: str) -> bool:
+    """Whether a URL names a network destination the scope gate should judge."""
+    return (urlparse(url).scheme or "").lower() in ("http", "https")
+
+
+def _scope_permits(scope: TargetScope, url: str) -> bool:
+    """
+    The scope gate in one place, so every path asks the same question.
+
+    In scope (the target) or an operator-declared outbound destination. Kept as a
+    function rather than a method because both the browser guard and the plain-HTTP
+    redirect handler need it, and a second copy is how the two would drift.
+    """
+    return scope.permits_url(url) or scope.authorize_outbound(url)
 
 
 async def _capture_response(
@@ -485,18 +743,35 @@ class AuditRunner:
             send_headers["Referer"] = plan.referer
 
         started = time.monotonic()
+        blocked_hosts: List[str] = []
         status, resp_headers, body, error = await asyncio.to_thread(
-            self._http_fetch, url, send_headers
+            self._http_fetch, url, send_headers, blocked_hosts
         )
         result.latencies.append(time.monotonic() - started)
         result.requests_made = 1
         result.finished_at = time.time()
         result.http_status = status
+        if blocked_hosts:
+            result.blocked_hosts = list(blocked_hosts)
+            for host in blocked_hosts:
+                result.evidence.append(
+                    f"scope gate refused a redirect to {host!r}; no request was sent"
+                )
 
         if error:
             result.launcher_error = error
             result.reason = error
-            result.verdict = Verdict.ERROR
+            # A request the scope gate refused is not a transport failure. It is a
+            # finding about the target's links, so it gets its own verdict rather
+            # than being reported as "the audit could not reach the site".
+            if result.blocked_hosts:
+                result.verdict = Verdict.OUT_OF_SCOPE
+                result.reason = (
+                    "the scope gate refused a redirect to "
+                    + ", ".join(repr(h) for h in result.blocked_hosts)
+                )
+            else:
+                result.verdict = Verdict.ERROR
             return result
 
         verdict = classify_response(status, resp_headers, body)
@@ -507,15 +782,24 @@ class AuditRunner:
         return result
 
     def _http_fetch(
-        self, url: str, headers: Dict[str, str]
+        self,
+        url: str,
+        headers: Dict[str, str],
+        blocked_out: Optional[List[str]] = None,
     ) -> Tuple[Optional[int], Dict[str, str], str, Optional[str]]:
         """Synchronous fetch, run in a thread so the event loop stays responsive."""
         import urllib.error
         import urllib.request
 
         request = urllib.request.Request(url, headers=headers, method="GET")
+        opener = urllib.request.build_opener(
+            _ScopedRedirectHandler(
+                lambda target: _scope_permits(self.config.scope, target),
+                blocked_out,
+            )
+        )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with opener.open(request, timeout=20) as response:
                 return (
                     response.status,
                     dict(response.headers.items()),
@@ -535,6 +819,16 @@ class AuditRunner:
                 body,
                 None,
             )
+        except ScopeViolation as exc:
+            # The redirect gate refused a hop. urllib wraps handler exceptions in
+            # a generic URLError, so the refusal is reported through its own type
+            # rather than as a transport failure.
+            return None, {}, "", f"ScopeViolation: {exc}"
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ScopeViolation):
+                return None, {}, "", f"ScopeViolation: {reason}"
+            return None, {}, "", f"{type(exc).__name__}: {exc}"
         except Exception as exc:
             return None, {}, "", f"{type(exc).__name__}: {exc}"
 
@@ -585,7 +879,8 @@ class AuditRunner:
             return result
 
         try:
-            await self._drive_journey(context, level, plan, url, nav_headers, result)
+            await self._install_scope_guard(context, level, url, nav_headers, plan, result)
+            await self._drive_journey(context, level, plan, url, result)
         finally:
             try:
                 await context.close()
@@ -595,67 +890,81 @@ class AuditRunner:
         result.finished_at = time.time()
         return result
 
-    async def _install_navigation_headers(self, page, url: str, headers, referer) -> None:
+    async def _install_scope_guard(
+        self,
+        context,
+        level: EvasionLevel,
+        url: str,
+        headers: Dict[str, str],
+        plan,
+        result: VisitResult,
+    ) -> None:
         """
-        Apply the rung's navigation headers to the first navigation only.
+        Put the scope gate on the wire, once, for the whole context.
 
-        Two constraints shape this. The navigation-only headers (Sec-Fetch-*,
-        Accept, Cache-Control) must reach the document request without being
-        stamped on every subresource, which rules out context-level
-        `extra_http_headers`. And the Referer must be set for the *arrival* and
-        then left alone: a browser derives the referer for every later navigation
-        from the page it is leaving, and overriding the header set wholesale would
-        throw that away -- turning a natural link-follow into a bare request.
+        A single context-level route replaces the per-page header route, because
+        the two cannot coexist: measured on this Playwright, a page-level route
+        takes precedence and a context-level one never runs, so a header route on
+        the page would silently disable the scope guard underneath it. One handler
+        then has to do both jobs -- stamp the arrival's navigation-only headers
+        *and* judge every request -- which is why `_ScopeGuard` takes the stamping
+        callback rather than the runner installing a second route.
 
-        So the route intercepts exactly one request (the first navigation) and then
-        removes itself. Everything after that is the browser's own header set,
-        untouched.
+        The stamp applies to the first navigation only, for the reason it always
+        did: a browser derives the Referer for later hops from the page it is
+        leaving, and a rung's `Accept`/`Sec-Fetch-*` belong on the document, not on
+        every stylesheet.
+
+        The blocked-host recorder is per-visit: the guard reports each refusal
+        here, and the first refusal of each host lands on the visit as a finding.
         """
         wanted = dict(headers or {})
-        if referer:
-            wanted[_REFERER_HEADER] = referer
-        if not wanted:
-            return
+        if plan.referer:
+            wanted[_REFERER_HEADER] = plan.referer
 
         target_host = urlparse(url).netloc
-        done = False
 
-        async def handler(route, request) -> None:
-            nonlocal done
-            consumed = False
-            try:
-                if (
-                    not done
-                    and request.is_navigation_request()
-                    and urlparse(request.url).netloc == target_host
-                ):
-                    consumed = True
-                    await route.continue_(
-                        headers=_merge_navigation_headers(request.headers, wanted)
-                    )
-                    return
-                await route.continue_()
-            except Exception:
-                # A route that raises would leave the request hanging; let it
-                # through unmodified rather than stall the visit.
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
-            finally:
-                if consumed:
-                    done = True
-                    # Only the first navigation is ours; later ones need the
-                    # browser's own Referer, which this route would clobber.
-                    try:
-                        await page.unroute("**/*", handler)
-                    except Exception:
-                        pass
+        def stamp(request) -> Optional[Dict[str, str]]:
+            if not wanted:
+                return None
+            if not request.is_navigation_request():
+                return None
+            if urlparse(request.url).netloc != target_host:
+                return None
+            return dict(wanted)
 
+        def on_block(host: str, blocked_url: str, resource_type: str) -> None:
+            if host and host not in result.blocked_hosts:
+                result.blocked_hosts.append(host)
+                label = "redirect to" if resource_type == "redirect" else "subresource from"
+                result.evidence.append(
+                    f"scope gate refused a {label} {host!r}; no request was sent"
+                )
+
+        def on_sent(count: int) -> None:
+            # The guard sees every request the browser makes, which is the only
+            # place the subresource side of the census can be counted. The
+            # navigations the runner drives are counted separately (one per
+            # `goto`/`page.goto`), so those are not attributed here twice.
+            if count > 0:
+                result.subrequests_made += count
+
+        guard = _ScopeGuard(
+            self.config.scope,
+            limiter=self._limiter,
+            on_block=on_block,
+            on_sent=on_sent,
+            stamp=stamp,
+        )
         try:
-            await page.route("**/*", handler)
-        except Exception:
-            pass
+            await context.route("**/*", guard.handle)
+        except Exception as exc:
+            # Without the guard there is no enforced scope, and running anyway
+            # would be exactly the uncontained behavior the gate exists to stop.
+            raise ScopeViolation(
+                f"could not install the scope gate on the browser context "
+                f"({type(exc).__name__}: {exc}); refusing to run uncontained"
+            )
 
     async def _drive_journey(
         self,
@@ -663,14 +972,16 @@ class AuditRunner:
         level: EvasionLevel,
         plan,
         url: str,
-        nav_headers: Dict[str, str],
         result: VisitResult,
     ) -> None:
-        """Walk one visitor through their planned session, honoring the plan."""
+        """
+        Walk one visitor through their planned session, honoring the plan.
+
+        The scope gate is already installed on the context by `_visit_browser`;
+        nothing here needs to route requests itself.
+        """
         page = await context.new_page()
         try:
-            await self._install_navigation_headers(page, url, nav_headers, plan.referer)
-
             await self._limiter.acquire()
             started = time.monotonic()
             status = None
@@ -1133,7 +1444,7 @@ class AuditRunner:
         # Re-check right before the navigation. The gate is the only thing between
         # this and an unauthorized request, and re-reading it here means a banner
         # whose href changed between discovery and click cannot be followed.
-        if not self.config.scope.check_unattended(destination):
+        if not _scope_permits(self.config.scope, destination):
             event.skipped_reason = "outbound destination was not authorized by scope"
             event.refused_by_scope = True
             result.evidence.append(f"refused out-of-scope campaign link {destination!r}")
@@ -1551,16 +1862,12 @@ class AuditRunner:
                 return visit
             return await self._run_browser_visit(level, plan, url, proxy_session, index)
         except ScopeViolation as exc:
-            visit = VisitResult(
-                visitor_index=index,
-                level_id=level.id,
-                started_at=time.time(),
-                finished_at=time.time(),
-                verdict=Verdict.ERROR,
-                reason=str(exc),
-                launcher_error="ScopeViolation",
-            )
-            return visit
+            # A ScopeViolation no longer means "this one URL was out of scope" --
+            # the guard handles that per-request, by aborting it. It now means the
+            # scope gate could not be enforced at all, which is a condition under
+            # which *no* visit is trustworthy. Fail the run closed rather than
+            # collect verdicts from traffic that was never contained.
+            raise SafetyStop(f"scope gate unavailable: {exc}") from exc
         finally:
             self._release_proxy(proxy_session)
 
