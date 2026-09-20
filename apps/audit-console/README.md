@@ -76,7 +76,11 @@ Other limits, all enforced server-side:
 - The engine's own ceilings (`max_requests`, `max_rps`, `max_concurrency`) abort
   the run rather than merely advising; a run that hits one records why.
 - Proxy passwords are redacted before they can reach a report or a log.
-- Concurrency is bounded, so the console cannot be used as a request amplifier.
+- **Audits are capped across the service, not just within one.** A shared
+  admission limit (3 by default) bounds how many audits run at once, so a burst of
+  requests cannot multiply the visitor count; a request that finds no slot is
+  refused with a 503 and a `Retry-After` rather than queued forever.
+- **Concurrency is bounded, so the console cannot be used as a request amplifier.**
 
 The UI is served from the same origin and resolves through a single asset reader
 that accepts only a bare filename, so a path-traversal request cannot read the

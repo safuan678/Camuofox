@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .runs import AuditService, TargetNotAllowed
+from .runs import AuditService, TargetNotAllowed, TooManyAudits
 
 UI_DIR = Path(__file__).resolve().parent / "ui"
 MAX_BODY_BYTES = 64 * 1024
@@ -77,13 +77,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     # -- plumbing ----------------------------------------------------------
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         # The UI is served from this same origin and needs no external asset.
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -202,6 +210,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             )
         except TargetNotAllowed as exc:
             return self._send(*_json_bytes({"error": str(exc)}, 403))
+        except TooManyAudits as exc:
+            # 503, not 403: the request was fine, the service is full. Retrying
+            # is the right answer, which is a different instruction to a caller
+            # than "you may not do this".
+            return self._send(
+                *_json_bytes({"error": str(exc)}, 503),
+                extra_headers={"Retry-After": "30"},
+            )
         except (TypeError, ValueError) as exc:
             return self._send(*_json_bytes({"error": f"bad parameters: {exc}"}, 400))
         return self._send(*_json_bytes(session.snapshot(), 202))
