@@ -10,10 +10,12 @@ Run with:
     cd apps/audit-console && python -m pytest tests/ -v
 """
 
+import asyncio
 import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -615,3 +617,91 @@ def test_a_pool_set_at_launch_behaves_like_one_set_from_the_ui():
         "labels": ["http://u:***@127.0.0.1:9"],
         "gateway": "",
     }
+
+
+# --------------------------------------------------------------------------
+# concurrency ceiling
+
+
+def test_concurrent_audits_share_one_ceiling(monkeypatch):
+    """
+    The per-audit `max_concurrency` is not a ceiling on the *service*.
+
+    Without a shared limit, N simultaneous requests each get their own audit and
+    their own six visitors, so the console runs Nx6 visitors against the target
+    at once -- an unbounded request amplifier. This asserts the service refuses
+    rather than silently exceeding the cap it advertises.
+    """
+    import console.runs as runs
+
+    # A real audit on the demo finishes in well under the timeout, so hold the
+    # slots with sessions that never reach a terminal state: patch `AuditRunner`
+    # to block until told to stop. That measures the admission gate itself
+    # rather than racing a fast run.
+    release = threading.Event()
+
+    class BlockingRunner:
+        def __init__(self, config, on_progress=None, cancel_event=None):
+            self._cancel = cancel_event
+
+        async def run(self):
+            while not release.is_set() and not (self._cancel and self._cancel.is_set()):
+                await asyncio.sleep(0.01)
+            raise RuntimeError("cancelled for the test")
+
+    monkeypatch.setattr(runs, "AuditRunner", BlockingRunner)
+    monkeypatch.setattr(runs, "CONSOLE_MAX_RUNNING_AUDITS", 2)
+    monkeypatch.setattr(runs, "CONSOLE_ADMISSION_TIMEOUT_S", 0.5)
+
+    service = AuditService(allowed_hosts=["127.0.0.1"], demo_target="http://127.0.0.1:1/")
+    service._admission = threading.BoundedSemaphore(2)
+
+    def start():
+        return service.start_audit(
+            target_url="http://127.0.0.1:1/",
+            visitor_count=1,
+            duration_hours=0.01,
+            max_level=0,
+            seed=None,
+        )
+
+    first, second = start(), start()
+    assert service.running_audits() == 2
+
+    # The third waits, finds no slot within the (shortened) timeout, refuses.
+    with pytest.raises(runs.TooManyAudits):
+        start()
+
+    # A finishing audit returns its slot, so the console recovers.
+    first.cancel()
+    deadline = time.time() + 10
+    while service.running_audits() > 1 and time.time() < deadline:
+        time.sleep(0.05)
+    release.set()
+    second.cancel()
+
+
+def test_a_failed_start_does_not_leak_an_admission_slot(monkeypatch):
+    """
+    A rejected request must not consume capacity, or repeated refusals would
+    wedge the console shut without a single audit running.
+    """
+    import console.runs as runs
+
+    monkeypatch.setattr(runs, "CONSOLE_MAX_RUNNING_AUDITS", 1)
+    monkeypatch.setattr(runs, "CONSOLE_ADMISSION_TIMEOUT_S", 0.5)
+    service = AuditService(allowed_hosts=["127.0.0.1"], demo_target="http://127.0.0.1:1/")
+    service._admission = threading.BoundedSemaphore(1)
+
+    for _ in range(5):
+        with pytest.raises(runs.TargetNotAllowed):
+            service.start_audit(
+                target_url="http://not-allowed.invalid/",
+                visitor_count=1,
+                duration_hours=0.01,
+                max_level=0,
+                seed=None,
+            )
+
+    # The slot is still available: a legitimate run can be admitted.
+    service._admission.acquire(timeout=0.1)

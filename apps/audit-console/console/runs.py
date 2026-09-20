@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ._engine import (
     AuditConfig,
@@ -43,6 +43,24 @@ CONSOLE_LIMITS = SafetyLimits(
     max_arrivals_per_minute=120,
     abort_after_consecutive_errors=15,
 )
+
+#: How many audits may run at the same time. `CONSOLE_LIMITS.max_concurrency`
+#: bounds the visitors *within* one audit; without a bound *across* audits, N
+#: concurrent requests each get their own thread and their own six visitors, so
+#: the console's real concurrency -- and its outbound request rate -- is Nx6
+#: rather than 6. A shared ceiling is the difference between a bounded service
+#: and a request amplifier, so it is enforced here, not per session.
+CONSOLE_MAX_RUNNING_AUDITS = 3
+
+#: How long a request waits for an admission slot before being refused. Bounded
+#: rather than infinite so a saturated console answers a caller instead of
+#: parking an HTTP worker thread until something else finishes.
+CONSOLE_ADMISSION_TIMEOUT_S = 30.0
+
+
+class TooManyAudits(RuntimeError):
+    """The console is already running as many audits as it allows at once."""
+
 
 MAX_VISITORS = 400
 #: L6 is the end of the engine's ladder; nothing above it exists to climb.
@@ -94,6 +112,11 @@ class AuditSession:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cancel: Optional[threading.Event] = field(default=None, repr=False)
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
+    #: Called exactly once when this session stops running, whatever the outcome.
+    #: The service uses it to give back the admission slot it took to start this
+    #: audit; a crash must not leak that slot, or the console wedges shut.
+    on_finish: Optional[Callable[[], None]] = field(default=None, repr=False)
+    _finished: bool = field(default=False, repr=False)
 
     # -- progress ----------------------------------------------------------
 
@@ -183,6 +206,23 @@ class AuditSession:
             if self.status == "running":
                 self.status = "done"
             self._append({"event": "end", "status": self.status})
+            self._release_slot()
+
+    def _release_slot(self) -> None:
+        """
+        Hand the admission slot back, exactly once.
+
+        Guarded by `_finished` because both the normal completion path and an
+        explicit cancellation can reach here; releasing a `BoundedSemaphore`
+        twice would let one audit's completion admit two more.
+        """
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            callback = self.on_finish
+        if callback is not None:
+            callback()
 
     async def _run_async(self, config: AuditConfig, cancel: threading.Event) -> None:
         runner = AuditRunner(
@@ -233,6 +273,14 @@ class AuditService:
         self._sessions: Dict[str, AuditSession] = {}
         self._lock = threading.Lock()
         self._cap = 20
+        # Blocks when `CONSOLE_MAX_RUNNING_AUDITS` audits are already in flight,
+        # released by whichever session finishes first. Sized once here rather
+        # than per session, because the thing being bounded is the service.
+        self._admission = threading.BoundedSemaphore(CONSOLE_MAX_RUNNING_AUDITS)
+
+    def running_audits(self) -> int:
+        with self._lock:
+            return sum(1 for s in self._sessions.values() if s.status == "running")
 
     # -- scope -------------------------------------------------------------
 
@@ -264,6 +312,41 @@ class AuditService:
     # -- sessions ----------------------------------------------------------
 
     def start_audit(
+        self,
+        *,
+        target_url: str,
+        visitor_count: int,
+        duration_hours: float,
+        max_level: int,
+        seed: Optional[int],
+        extra_headers: Optional[Dict[str, str]] = None,
+        single_level: Optional[int] = None,
+    ) -> AuditSession:
+        # Wait for a slot rather than refuse: the caller asked for an audit and
+        # will get one, just not simultaneously with an unbounded number of
+        # others. A long timeout turns "the console is saturated" into a 503
+        # instead of a request that blocks a worker thread indefinitely.
+        if not self._admission.acquire(timeout=CONSOLE_ADMISSION_TIMEOUT_S):
+            raise TooManyAudits(
+                f"{CONSOLE_MAX_RUNNING_AUDITS} audits are already running; try "
+                f"again when one finishes."
+            )
+        try:
+            session = self._prepare_audit(
+                target_url=target_url,
+                visitor_count=visitor_count,
+                duration_hours=duration_hours,
+                max_level=max_level,
+                seed=seed,
+                extra_headers=extra_headers,
+                single_level=single_level,
+            )
+        except BaseException:
+            self._admission.release()
+            raise
+        return session
+
+    def _prepare_audit(
         self,
         *,
         target_url: str,
@@ -368,6 +451,10 @@ class AuditService:
             single_level_mode=single_level_mode,
             proxy_summary=pool.summary() if pool is not None else None,
             seed=seed,
+            # Bound *before* the thread starts, so a fast finish cannot find the
+            # slot unwired. The slot is held until this session reaches a
+            # terminal state, which `_release_slot` signals.
+            on_finish=self._admission.release,
         )
         with self._lock:
             self._sessions[session.id] = session

@@ -410,7 +410,19 @@ Invariants worth not breaking:
   zipapp form; a plain `Path` read inside the archive silently fails.
 - **The console's ceilings are not caller-settable.** `CONSOLE_LIMITS` and the
   visitor/level caps apply regardless of the request, because the console is
-  shared.
+  shared. **The ceiling has to hold across audits, not just within one.**
+  `CONSOLE_LIMITS.max_concurrency` bounds the visitors inside a single audit;
+  `AuditService._admission` (a `BoundedSemaphore`, `CONSOLE_MAX_RUNNING_AUDITS`)
+  is what bounds how many audits run at once. Without it, N concurrent requests
+  each get their own thread and their own six visitors, so the console's real
+  concurrency is Nx6 and a shared instance is an unbounded request amplifier.
+  The slot is taken in `start_audit` and given back by the session's
+  `on_finish`/`_release_slot`, which is guarded by `_finished` so a `BoundedSemaphore`
+  cannot be released twice. A request that finds no slot within
+  `CONSOLE_ADMISSION_TIMEOUT_S` gets a **503 with `Retry-After`** — distinct from
+  the 403 that means "you may not audit this host": the request was fine, the
+  service is full, and retrying is the right answer. A failed start must release
+  its slot or repeated refusals wedge the console shut with nothing running.
 
 Tests: `apps/audit-console/tests/test_console.py` — drives the real HTTP surface
 against the real demo WAF. No mocks: most of the tests exist to prove the refusals
