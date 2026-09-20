@@ -31,7 +31,9 @@ Useful flags:
 
 | Flag | Effect |
 | --- | --- |
-| `--host` / `--port` | Where to bind (default `0.0.0.0:8000`) |
+| `--host` / `--port` | Where to bind (default `127.0.0.1:8000`, loopback only) |
+| `--auth-token TOKEN` | Require a bearer token on every API route; required to bind an exposed address |
+| `--origin URL` | An origin allowed to POST (repeatable); defaults to same-origin |
 | `--target URL --i-am-authorized` | Audit your own host instead of the demo |
 | `--export DIR` | Run one audit headlessly, write every report format, exit |
 | `--self-test` | Audit the demo at L0 in-process; nonzero exit on failure |
@@ -50,8 +52,22 @@ the one thing it promises.
 
 ## Hosting it
 
-The console is safe to expose, but read this first, because the default that makes
-it safe also makes it narrow.
+The console **binds loopback by default**. That is the secure default: a console
+on a laptop is reachable by the person at the laptop and by nobody else, with no
+configuration. Exposing it is a deliberate act with a deliberate cost.
+
+To serve it to a network, name an interface *and* a token:
+
+```bash
+python3 app.py --host 0.0.0.0 --auth-token "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+```
+
+The console **refuses to start** if you bind a non-loopback address without
+`--auth-token` — it exits 2 with an explanation rather than starting exposed and
+trusting you to have read this file. With a token set, every API route requires
+`Authorization: Bearer <token>`; the UI prompts for it once and keeps it in
+`sessionStorage`, never in a URL, so it stays out of access logs and history. The
+two health endpoints stay open, because a probe cannot present a credential.
 
 **It only audits its own demo target.** The target host is checked against an
 allow-list *before any request leaves*, and the check raises rather than returning
@@ -80,7 +96,25 @@ Other limits, all enforced server-side:
   admission limit (3 by default) bounds how many audits run at once, so a burst of
   requests cannot multiply the visitor count; a request that finds no slot is
   refused with a 503 and a `Retry-After` rather than queued forever.
-- **Concurrency is bounded, so the console cannot be used as a request amplifier.**
+- **Cross-origin POSTs are refused.** A browser cannot forge `Origin`, so a page
+  on another site cannot drive the console from a visitor's browser. A request
+  with no `Origin` (curl, a script) is governed by the token and the bind instead.
+- **The routes that cost something are rate-limited per IP** — starting an audit
+  and setting a proxy pool, 30 per minute each. Read-only polling is deliberately
+  unlimited, so watching a running audit is never penalised.
+
+### Running behind a proxy or orchestrator
+
+The console is **single-process by design**: sessions live in memory, so two
+workers behind a load balancer would have disjoint stores and a poll for an id
+created on the other worker would 404. Run one worker.
+
+Use `/api/health` for liveness and `/api/health/ready` for readiness. Readiness
+answers 503 with a named blocker — "all 3 audit slots are in use", "no demo target
+and no allow-list" — when the console is up but cannot accept work. Probing only
+liveness routes traffic to a full console and turns saturation into a wave of 503s
+that read like a bug. If TLS terminates upstream under another name, pass
+`--origin https://console.example.com` so the same-origin check accepts it.
 
 The UI is served from the same origin and resolves through a single asset reader
 that accepts only a bare filename, so a path-traversal request cannot read the

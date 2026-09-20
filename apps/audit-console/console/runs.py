@@ -57,6 +57,17 @@ CONSOLE_MAX_RUNNING_AUDITS = 3
 #: parking an HTTP worker thread until something else finishes.
 CONSOLE_ADMISSION_TIMEOUT_S = 30.0
 
+#: Per-IP request budgets for the routes that cost something, over
+#: `RATE_LIMIT_WINDOW_S`. Read-only polls are absent on purpose and unlimited.
+#: This is a flood brake, not the admission control -- that is the semaphore,
+#: which is exact about concurrency. Deliberately loose: a legitimate operator
+#: restarting a few audits must never trip it.
+RATE_LIMIT_PER_ROUTE = {"/api/audits": 30, "/api/proxy": 30}
+RATE_LIMIT_WINDOW_S = 60.0
+#: Cap on the number of (ip, route) buckets kept, so a caller cycling source
+#: addresses cannot grow the table without bound.
+RATE_TABLE_MAX = 4096
+
 
 class TooManyAudits(RuntimeError):
     """The console is already running as many audits as it allows at once."""
@@ -277,10 +288,84 @@ class AuditService:
         # released by whichever session finishes first. Sized once here rather
         # than per session, because the thing being bounded is the service.
         self._admission = threading.BoundedSemaphore(CONSOLE_MAX_RUNNING_AUDITS)
+        self._rate: Dict[Any, List[float]] = {}
+        self._rate_lock = threading.Lock()
 
     def running_audits(self) -> int:
         with self._lock:
             return sum(1 for s in self._sessions.values() if s.status == "running")
+
+    def _evict_locked(self) -> None:
+        """
+        Trim finished sessions to `_cap`, never a running one. Caller holds `_lock`.
+
+        Evicting purely by age discarded a session that was still running -- so a
+        21st audit would delete the in-flight results of the 1st, and the caller
+        polling for them got a 404 for an audit that was still going. Running
+        sessions are therefore exempt from eviction; if they alone exceed the cap
+        the cap is simply breached, which is bounded anyway by
+        `CONSOLE_MAX_RUNNING_AUDITS` and is the correct trade against losing live
+        results.
+        """
+        if len(self._sessions) <= self._cap:
+            return
+        finished = sorted(
+            (s for s in self._sessions.values() if s.status != "running"),
+            key=lambda s: s.started_at,
+        )
+        for stale in finished[: len(self._sessions) - self._cap]:
+            self._sessions.pop(stale.id, None)
+
+    def readiness(self) -> Dict[str, Any]:
+        """
+        Whether this console can accept an audit right now, and if not, why.
+
+        Distinct from liveness on purpose. The process being up says nothing about
+        whether it can serve: with every admission slot held, or with no demo
+        target, it is live but not ready, and a load balancer routing to it
+        produces 503s that read like a bug. Each blocker is named so a caller is
+        told what to wait for rather than just "not ready".
+        """
+        blockers: List[str] = []
+        if not self.demo_target and not self.allowed_hosts:
+            blockers.append("no demo target and no allow-list: nothing may be audited")
+        # Non-blocking probe: if the slot cannot be taken now, the service is full.
+        if not self._admission.acquire(blocking=False):
+            blockers.append(
+                f"all {CONSOLE_MAX_RUNNING_AUDITS} audit slots are in use"
+            )
+        else:
+            self._admission.release()
+        return {"ready": not blockers, "blockers": blockers}
+
+    def note_request(self, client_ip: str, route: str) -> bool:
+        """
+        Record one request against a per-IP window. False means "refuse".
+
+        A crude flood brake in front of the exact admission control. It exists
+        because the semaphore bounds *concurrent* audits, not how fast a caller
+        can ask for them: an unauthenticated caller can otherwise retry in a tight
+        loop and keep all the slots churning. Only the routes that cost something
+        are limited, so polling a running audit is never penalised.
+        """
+        limit = RATE_LIMIT_PER_ROUTE.get(route)
+        if limit is None:
+            return True
+        now = time.monotonic()
+        cutoff = now - RATE_LIMIT_WINDOW_S
+        with self._rate_lock:
+            recent = [t for t in self._rate.get((client_ip, route), []) if t > cutoff]
+            if len(recent) >= limit:
+                self._rate[(client_ip, route)] = recent
+                return False
+            recent.append(now)
+            self._rate[(client_ip, route)] = recent
+            # Bound the table itself: a caller looping over new keys must not be
+            # able to grow it without limit.
+            if len(self._rate) > RATE_TABLE_MAX:
+                for key in [k for k, v in self._rate.items() if not any(t > cutoff for t in v)]:
+                    self._rate.pop(key, None)
+        return True
 
     # -- scope -------------------------------------------------------------
 
@@ -458,11 +543,7 @@ class AuditService:
         )
         with self._lock:
             self._sessions[session.id] = session
-            if len(self._sessions) > self._cap:
-                for stale in sorted(self._sessions, key=lambda k: self._sessions[k].started_at)[
-                    : len(self._sessions) - self._cap
-                ]:
-                    self._sessions.pop(stale, None)
+            self._evict_locked()
         session.start(config)
         for message in notices:
             session._append({"event": "notice", "message": message})

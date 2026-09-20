@@ -468,6 +468,11 @@ class AuditRunner:
         #: visit launches (and closes) its own.
         self._level_browser: Optional[Any] = None
         self._level_browser_handle: Optional[Tuple[Any, Any]] = None
+        #: One artifact per level, not per visitor: 100 visitors of the same
+        #: fingerprint would write 100 near-identical screenshots, and the first
+        #: is the one that shows what the rung encountered.
+        self._artifacts_written: set = set()
+        self._artifacts_by_level: Dict[int, List[str]] = {}
         if config.proxy:
             from camoufox.proxy import build_rotator
 
@@ -790,7 +795,33 @@ class AuditRunner:
         result.vendors = verdict.vendors
         result.reason = verdict.reason
         result.evidence = verdict.evidence
+        self._capture_http_artifact(level, result, body)
         return result
+
+    def _capture_http_artifact(
+        self, level: EvasionLevel, result: VisitResult, body: str
+    ) -> None:
+        """
+        Write the served HTML for a non-browser rung.
+
+        The browser rungs capture through a page handle; this rung has only the
+        response body, so it writes that. Without this, `artifact_dir` silently
+        produced nothing for a run made entirely of HTTP rungs -- and L0 is the
+        rung most likely to be blocked, which is the page worth keeping.
+        """
+        if not self.config.artifact_dir or level.id in self._artifacts_written:
+            return
+        self._artifacts_written.add(level.id)
+        directory = Path(self.config.artifact_dir)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            html = directory / f"{level.id:02d}-{level.key}.html"
+            html.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            result.evidence.append(f"artifact capture failed: {type(exc).__name__}: {exc}")
+            return
+        result.evidence.append(f"html: {html}")
+        self._artifacts_by_level.setdefault(level.id, []).append(str(html))
 
     def _http_fetch(
         self,
@@ -900,6 +931,52 @@ class AuditRunner:
 
         result.finished_at = time.time()
         return result
+
+    async def _capture_artifact(self, page, level: EvasionLevel, result: VisitResult) -> None:
+        """
+        Write the evidence for one rung: a screenshot and the served HTML.
+
+        `AuditConfig.artifact_dir` was declared and documented but read nowhere,
+        so setting it silently did nothing. It is captured here because a finding
+        an operator cannot inspect is one they have to take on trust -- "blocked,
+        Cloudflare, 403" is far more actionable with the page that said it.
+
+        One artifact per rung, not per visitor: the visitors of a rung share a
+        fingerprint and a posture, so the second screenshot is near-identical and
+        only costs disk. The *first* visit is the informative one, because it is
+        what the rung encountered before any challenge state accumulated.
+
+        Best-effort by design. A screenshot failing (offscreen platform, a page
+        already gone) must not turn a completed audit into a failed one, so a
+        capture error is recorded as evidence rather than raised.
+        """
+        if not self.config.artifact_dir or level.id in self._artifacts_written:
+            return
+        # Mark first: a capture that fails must not be retried 99 more times.
+        self._artifacts_written.add(level.id)
+
+        directory = Path(self.config.artifact_dir)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            result.evidence.append(f"could not create artifact directory {directory}: {exc}")
+            return
+
+        stem = f"{level.id:02d}-{level.key}"
+        try:
+            shot = directory / f"{stem}.png"
+            await page.screenshot(path=str(shot), full_page=False)
+            result.evidence.append(f"screenshot: {shot}")
+            self._artifacts_by_level.setdefault(level.id, []).append(str(shot))
+        except Exception as exc:  # noqa: BLE001 - evidence is best-effort
+            result.evidence.append(f"screenshot failed: {type(exc).__name__}: {exc}")
+        try:
+            html = directory / f"{stem}.html"
+            html.write_text(await page.content(), encoding="utf-8")
+            result.evidence.append(f"html: {html}")
+            self._artifacts_by_level.setdefault(level.id, []).append(str(html))
+        except Exception as exc:  # noqa: BLE001 - evidence is best-effort
+            result.evidence.append(f"html capture failed: {type(exc).__name__}: {exc}")
 
     async def _install_scope_guard(
         self,
@@ -1020,6 +1097,10 @@ class AuditRunner:
             result.evidence = list(verdict.evidence)
             result.pages_loaded = 1
 
+            # Capture the arrival page -- including when it was a block or a
+            # challenge, which is exactly the page an operator most wants to see.
+            await self._capture_artifact(page, level, result)
+
             # A challenge or block ends the visit: there is nothing beyond it to
             # measure, and pushing on would be probing a closed door.
             if verdict.detected or verdict.verdict == Verdict.ERROR:
@@ -1076,6 +1157,17 @@ class AuditRunner:
                 )
 
                 if page_index >= plan.page_count - 1:
+                    break
+
+                # Per-visitor request ceiling. The plan's page count was the only
+                # bound before, so this documented setting did nothing -- a safety
+                # control that silently no-ops is worse than none, because it is
+                # relied on.
+                cap = int(self.config.journey.max_requests_per_visitor)
+                if cap > 0 and result.requests_made >= cap:
+                    result.evidence.append(
+                        f"stopped at the per-visitor request ceiling ({cap})"
+                    )
                     break
 
                 next_url = await self._pick_next_url(page, plan)
@@ -1834,6 +1926,7 @@ class AuditRunner:
             self._level_browser_handle = None
 
         lr.finished_at = time.time()
+        lr.artifacts = list(self._artifacts_by_level.get(level.id, []))
         self._progress(event="level_end", level_id=level.id, level=lr.to_dict())
         return lr
 

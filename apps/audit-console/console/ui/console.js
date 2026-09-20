@@ -36,8 +36,32 @@ const el = (id) => document.getElementById(id);
 
 let pollTimer = null;
 
+/* The console may require a bearer token. It is held in sessionStorage and never
+ * embedded in the page or a URL: a token in a query string ends up in access
+ * logs and browser history, and a token injected into index.html would be handed
+ * to anyone who can load the page. Asking once and remembering for the session
+ * keeps it out of both. */
+const TOKEN_KEY = "console-token";
+const getToken = () => sessionStorage.getItem(TOKEN_KEY) || "";
+const askToken = () =>
+  window.prompt("This console requires an access token:") || "";
+
+async function rawFetch(path, options = {}) {
+  const headers = Object.assign({}, options.headers);
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return fetch(path, Object.assign({}, options, { headers }));
+}
+
 async function api(path, options) {
-  const res = await fetch(path, options);
+  let res = await rawFetch(path, options);
+  if (res.status === 401) {
+    const token = askToken();
+    if (token) {
+      sessionStorage.setItem(TOKEN_KEY, token);
+      res = await rawFetch(path, options);
+    }
+  }
   const text = await res.text();
   let body;
   try {
@@ -177,8 +201,42 @@ function renderResult(session) {
   const exports = el("exports");
   exports.hidden = false;
   exports.querySelectorAll("a").forEach((a) => {
-    a.href = `/api/audits/${session.id}/report?format=${a.dataset.fmt}`;
+    a.onclick = (event) => {
+      event.preventDefault();
+      downloadReport(session.id, a.dataset.fmt);
+    };
   });
+}
+
+/* Exports are fetched, not linked. A plain href cannot carry the Authorization
+ * header, so with auth on it would 401; and putting the token in the query
+ * string instead would leak it into access logs. Fetching and handing the
+ * browser a Blob keeps the token in the header where it belongs. */
+async function downloadReport(sessionId, fmt) {
+  try {
+    const res = await rawFetch(`/api/audits/${sessionId}/report?format=${fmt}`);
+    if (!res.ok) {
+      const text = await res.text();
+      let message = `export failed (${res.status})`;
+      try {
+        message = JSON.parse(text).error || message;
+      } catch (err) {
+        /* not JSON; keep the status message */
+      }
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `audit-${sessionId}.${fmt === "text" ? "txt" : fmt}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    showError(err.message);
+  }
 }
 
 async function poll(sessionId, since) {

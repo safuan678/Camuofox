@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +37,7 @@ from PySide6.QtCore import (
 from ..audit import (
     AuditConfig,
     AuditRunner,
+    JourneyConfig,
     SafetyLimits,
     TargetScope,
     build_schedule,
@@ -46,6 +49,10 @@ from ..audit.schedule import ArrivalPattern
 
 __all__ = ["AuditVisitModel", "AuditBackend"]
 
+#: RFC 9110 token, which is what a header field name must be. Used to reject a
+#: typo like "Authorization :" before it becomes a mystery 401.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
 
 _VERDICT_COLOR = {
     _Verdict.ALLOWED: "#6b9e7e",
@@ -54,6 +61,43 @@ _VERDICT_COLOR = {
     _Verdict.BLOCKED: "#f14c4c",
     _Verdict.ERROR: "#a0a0a0",
 }
+
+
+def _parse_header_lines(raw: str) -> Dict[str, str]:
+    """
+    Parse "Name: value" lines into a header dict.
+
+    Raises ValueError with the offending line number rather than skipping a
+    malformed line, because a silently dropped `Authorization:` header turns a
+    logged-in audit into an audit of the login redirect -- and the report would
+    say "allowed", which is a wrong answer presented as a finding.
+    """
+    headers: Dict[str, str] = {}
+    for number, line in enumerate((raw or "").splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name, sep, value = stripped.partition(":")
+        name = name.strip()
+        if not sep or not name:
+            raise ValueError(
+                f"header line {number} is not 'Name: value' ({stripped!r})"
+            )
+        if not _HEADER_NAME_RE.match(name):
+            raise ValueError(f"header line {number} has an invalid name ({name!r})")
+        headers[name] = value.strip()
+    return headers
+
+
+def _parse_path_lines(raw: str) -> List[str]:
+    """Parse one path per line, normalising each to a leading slash."""
+    paths: List[str] = []
+    for line in (raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        paths.append(stripped if stripped.startswith("/") else "/" + stripped)
+    return paths
 
 
 class AuditVisitModel(QAbstractListModel):
@@ -218,6 +262,26 @@ class AuditBackend(QObject):
         self._max_concurrency = 4
         self._max_per_minute = 30
         self._max_per_proxy = 0
+        #: Consecutive transport errors before a rung is aborted. The engine's
+        #: ceiling, exposed because 15 is a sensible default for a healthy target
+        #: and the wrong one for a flaky one.
+        self._abort_after_errors = 15
+        #: Seconds between rungs. The engine's default is 30, which matters when a
+        #: target rate-limits: back-to-back rungs make the audit's own traffic the
+        #: thing being measured.
+        self._cooldown_s = 30.0
+        #: Extra in-scope paths to sample, one per line, e.g. "/pricing".
+        self._paths = ""
+        #: Headers every request carries, one "Name: value" per line. This is how
+        #: an audit reaches a surface behind a login: a session cookie or an
+        #: authorization token the operator already holds.
+        self._extra_headers = ""
+        #: Keep one browser open for a whole rung (default) or relaunch per visit.
+        self._reuse_browser = True
+        #: Where per-rung screenshots and HTML are written. Empty = none.
+        self._artifact_dir = ""
+        #: Extra with-headers ceiling applied to a single visitor's journey.
+        self._max_requests_per_visitor = 12
         #: Force headless for every browser rung. False (the default) honours each
         #: rung's own posture, which is what lets L1 be headless and L2 headful;
         #: ticking the box overrides them all, and the run announces the override.
@@ -496,6 +560,85 @@ class AuditBackend(QObject):
     @Slot(int)
     def setMaxPerProxy(self, value: int) -> None:
         self._max_per_proxy = max(0, int(value))
+        self.changed.emit()
+
+    @Property(int, notify=changed)
+    def abortAfterErrors(self):
+        return self._abort_after_errors
+
+    @Slot(int)
+    def setAbortAfterErrors(self, value: int) -> None:
+        """Consecutive transport errors that abort a rung (0 disables)."""
+        self._abort_after_errors = max(0, int(value))
+        self.changed.emit()
+
+    @Property(float, notify=changed)
+    def cooldownSeconds(self):
+        return self._cooldown_s
+
+    @Slot(float)
+    def setCooldownSeconds(self, value: float) -> None:
+        """Seconds to wait between finishing one rung and starting the next."""
+        self._cooldown_s = max(0.0, float(value))
+        self.changed.emit()
+
+    @Property(str, notify=changed)
+    def extraPaths(self):
+        return self._paths
+
+    @Slot(str)
+    def setExtraPaths(self, value: str) -> None:
+        self._paths = value or ""
+        self.changed.emit()
+
+    @Property(str, notify=changed)
+    def extraHeaders(self):
+        return self._extra_headers
+
+    @Slot(str)
+    def setExtraHeaders(self, value: str) -> None:
+        self._extra_headers = value or ""
+        self.changed.emit()
+
+    @Property(bool, notify=changed)
+    def reuseBrowser(self):
+        return self._reuse_browser
+
+    @Slot(bool)
+    def setReuseBrowser(self, value: bool) -> None:
+        """Keep one browser per rung (True) or launch one per visitor."""
+        self._reuse_browser = bool(value)
+        self.changed.emit()
+
+    @Property(str, notify=changed)
+    def artifactDir(self):
+        return self._artifact_dir
+
+    @Slot(str)
+    def setArtifactDir(self, value: str) -> None:
+        """Directory for per-rung screenshots and HTML. Empty disables capture."""
+        self._artifact_dir = (value or "").strip()
+        self.changed.emit()
+
+    @Slot(result="QVariantMap")
+    def browseArtifactDir(self) -> dict:
+        from PySide6.QtWidgets import QFileDialog
+
+        chosen = QFileDialog.getExistingDirectory(None, "Artifact directory")
+        if chosen:
+            self._artifact_dir = chosen
+            self.changed.emit()
+            return {"path": chosen, "ok": True, "message": ""}
+        return {"path": "", "ok": False, "message": "No directory selected."}
+
+    @Property(int, notify=changed)
+    def maxRequestsPerVisitor(self):
+        return self._max_requests_per_visitor
+
+    @Slot(int)
+    def setMaxRequestsPerVisitor(self, value: int) -> None:
+        """Ceiling on requests one visitor's journey may make."""
+        self._max_requests_per_visitor = max(1, int(value))
         self.changed.emit()
 
     @Property(bool, notify=changed)
@@ -793,6 +936,41 @@ class AuditBackend(QObject):
                 self.changed.emit()
                 return
 
+        # Both are parsed here rather than in QML so a typo is rejected with a
+        # reason instead of reaching the engine as a silently empty mapping. An
+        # audit that drops its own Authorization header still reports a verdict,
+        # and that verdict is about the login page.
+        try:
+            extra_headers = _parse_header_lines(self._extra_headers)
+        except ValueError as exc:
+            self._error = f"Custom headers: {exc}"
+            self.changed.emit()
+            return
+
+        paths = _parse_path_lines(self._paths)
+        for path in paths:
+            if not path.startswith("/") or "://" in path:
+                self._error = (
+                    f"Extra path {path!r} must be a path on the target "
+                    f"(e.g. /pricing), not a full URL: the audit stays on the "
+                    f"audited host."
+                )
+                self.changed.emit()
+                return
+
+        artifact_dir = self._artifact_dir.strip()
+        if artifact_dir:
+            try:
+                Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._error = f"Artifact directory unusable: {exc}"
+                self.changed.emit()
+                return
+
+        journey = replace(
+            JourneyConfig(), max_requests_per_visitor=self._max_requests_per_visitor
+        )
+
         config = AuditConfig(
             target_url=self._target,
             scope=scope,
@@ -805,16 +983,23 @@ class AuditBackend(QObject):
             visitor_count=self._visitors,
             duration_hours=self._hours,
             pattern=ArrivalPattern.ALL[self._pattern_index],
+            proxy=proxy,
+            seed=seed,
+            headless=True if self._force_headless else None,
+            paths=paths,
+            extra_headers=extra_headers,
+            cooldown_between_levels_s=self._cooldown_s,
+            artifact_dir=artifact_dir or None,
+            reuse_browser=self._reuse_browser,
+            journey=journey,
             limits=SafetyLimits(
                 max_requests=self._max_requests,
                 max_rps=self._max_rps,
                 max_concurrency=self._max_concurrency,
                 max_arrivals_per_minute=self._max_per_minute,
                 max_per_proxy=self._max_per_proxy,
+                abort_after_consecutive_errors=self._abort_after_errors,
             ),
-            proxy=proxy,
-            seed=seed,
-            headless=True if self._force_headless else None,
         )
 
         problems = config.validate()

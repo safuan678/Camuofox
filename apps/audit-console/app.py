@@ -46,7 +46,33 @@ def _parse_args(argv=None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "bind address (default: 127.0.0.1, loopback only). Pass 0.0.0.0 to "
+            "expose it -- on a shared network that is an explicit choice, and you "
+            "should also set --auth-token."
+        ),
+    )
+    parser.add_argument(
+        "--auth-token",
+        default="",
+        help=(
+            "require this bearer token on every API route (health stays open). "
+            "Required by policy when not binding to loopback."
+        ),
+    )
+    parser.add_argument(
+        "--origin",
+        action="append",
+        default=[],
+        metavar="URL",
+        help=(
+            "an origin allowed to POST (repeatable). Defaults to same-origin. "
+            "Set this when a reverse proxy terminates TLS under another name."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
     parser.add_argument(
         "--target",
@@ -278,6 +304,19 @@ def main(argv=None) -> int:
     host = target_url.split("//", 1)[1].split("/", 1)[0].split(":")[0]
     service = AuditService(allowed_hosts=[host], demo_target=target_url)
 
+    exposed = args.host not in ("127.0.0.1", "::1", "localhost")
+    if exposed and not args.auth_token:
+        # A secure default is cheaper than a documented caveat. Refusing here is
+        # the one moment it is cheap to be strict: the operator is at the console.
+        print(
+            f"Refusing to bind {args.host} with no --auth-token: that exposes every "
+            "report to anyone who can reach the port. Pass --auth-token, or bind "
+            "127.0.0.1 (the default).",
+            file=sys.stderr,
+        )
+        waf.stop()
+        return 2
+
     _warn_if_rotation_skipped(args)
     try:
         _configure_pool(service.proxies, args)
@@ -293,8 +332,15 @@ def main(argv=None) -> int:
     print(f"Audit console on http://{args.host}:{args.port}/")
     print("Press Ctrl+C to stop.")
 
+    if args.auth_token:
+        print("API auth: bearer token required (health endpoints stay open)")
+    else:
+        print("API auth: none, loopback only -- do not bind this to a network")
+
     thread = threading.Thread(
-        target=serve, args=(args.host, args.port, service), daemon=True
+        target=serve,
+        args=(args.host, args.port, service, args.auth_token, tuple(args.origin)),
+        daemon=True,
     )
     thread.start()
     try:

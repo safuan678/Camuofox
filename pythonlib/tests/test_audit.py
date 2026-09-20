@@ -22,6 +22,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from dataclasses import replace  # noqa: E402
+
 from camoufox.audit import (  # noqa: E402
     SINGLE_LEVEL_VISITORS,
     AuditConfig,
@@ -30,6 +32,7 @@ from camoufox.audit import (  # noqa: E402
     AuthorizationRequired,
     CAPABILITIES,
     EVASION_LEVELS,
+    JourneyConfig,
     LevelResult,
     SafetyLimits,
     ScopeViolation,
@@ -55,6 +58,9 @@ from camoufox.proxy import ProxyRotator  # noqa: E402
 class _WafHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     hits = 0
+    #: Every request's headers, so a test can assert what actually reached the
+    #: target rather than what the config merely accepted.
+    seen_headers = []
 
     def _send(self, status, body=b"", headers=None):
         self.send_response(status)
@@ -67,6 +73,7 @@ class _WafHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).hits += 1
+        type(self).seen_headers.append(dict(self.headers.items()))
         ua = self.headers.get("User-Agent", "")
         cookie = self.headers.get("Cookie", "")
 
@@ -3010,3 +3017,98 @@ def test_a_blocked_host_appears_as_a_finding_not_as_detection():
     findings = " ".join(build_findings(report))
     assert "undeclared.example.net" in findings
     assert "no request was sent" in findings.lower()
+
+
+# --------------------------------------------------------------------------
+# Settings that were documented but had no effect
+# --------------------------------------------------------------------------
+
+
+def test_extra_headers_reach_the_target(waf_server):
+    """
+    `extra_headers` must actually be sent, not merely accepted.
+
+    The setting is what lets an audit reach a surface behind a login. A header
+    dict that is stored but never put on the wire turns a logged-in audit into an
+    audit of the login redirect, and the verdict would still read "allowed".
+    """
+    config = _config(
+        waf_server,
+        extra_headers={"X-Audit-Probe": "sentinel-value"},
+    )
+    asyncio.run(AuditRunner(config).run())
+    sent = "\n".join(
+        f"{k}: {v}" for headers in _WafHandler.seen_headers for k, v in headers.items()
+    )
+    assert "sentinel-value" in sent, "the configured header never arrived at the target"
+
+
+def test_extra_paths_widen_what_is_sampled(waf_server):
+    """Every configured path must be a candidate the run can request."""
+    config = _config(waf_server, paths=["/pricing", "/docs"])
+    candidates = AuditRunner(config)._candidate_paths()
+    assert candidates[0] == waf_server, "the root must stay the primary candidate"
+    assert any(p.endswith("/pricing") for p in candidates)
+    assert any(p.endswith("/docs") for p in candidates)
+
+
+def test_per_visitor_request_ceiling_bounds_a_journey(waf_server):
+    """
+    The documented per-visitor cap must actually bound the journey.
+
+    It was declared in JourneyConfig and read nowhere, so a plan asking for more
+    pages than the cap produced more requests than the operator agreed to -- a
+    safety control that silently did nothing.
+    """
+    plan_config = replace(
+        JourneyConfig(),
+        pages_min=20,
+        pages_max=20,
+        bounce_probability=0.0,
+        max_requests_per_visitor=2,
+    )
+    report = asyncio.run(
+        AuditRunner(_config(waf_server, visitor_count=1, journey=plan_config)).run()
+    )
+    visits = [v for level in report.levels for v in level.visits]
+    assert visits, "the run produced no visits to measure"
+    for visit in visits:
+        assert visit.requests_made <= 2, (
+            f"a visit made {visit.requests_made} requests past a cap of 2"
+        )
+
+
+def test_artifact_dir_writes_evidence(waf_server, tmp_path):
+    """
+    `artifact_dir` must write something.
+
+    It was declared and documented as "screenshots, HTML" but read nowhere, so
+    setting it silently did nothing -- the worst kind of option, because the
+    operator then believes they hold evidence they never captured.
+    """
+    report = asyncio.run(
+        AuditRunner(_config(waf_server, artifact_dir=str(tmp_path), visitor_count=2)).run()
+    )
+    assert not report.aborted
+    written = sorted(tmp_path.iterdir())
+    assert written, "artifact_dir was set but no artifact was written"
+    assert {p.suffix for p in written} <= {".html", ".png"}
+
+
+def test_artifact_capture_is_off_by_default(waf_server, tmp_path):
+    """No artifact_dir means no stray files, and no artifact bookkeeping."""
+    report = asyncio.run(AuditRunner(_config(waf_server, visitor_count=1)).run())
+    assert not list(tmp_path.iterdir())
+    assert all(not level.artifacts for level in report.levels)
+    assert "artifacts" in report.levels[0].to_dict()
+
+
+def test_artifacts_are_recorded_on_the_level(waf_server, tmp_path):
+    """A level reports the artifacts it wrote, so a report can point at them."""
+    report = asyncio.run(
+        AuditRunner(_config(waf_server, artifact_dir=str(tmp_path), visitor_count=1)).run()
+    )
+    recorded = [a for level in report.levels for a in level.artifacts]
+    assert recorded, "the level did not record the artifacts it wrote"
+    assert all(Path(a).exists() for a in recorded)
+    assert len(recorded) == len(set(recorded)), "an artifact was recorded twice"

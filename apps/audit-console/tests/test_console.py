@@ -37,6 +37,10 @@ from console.server import make_server  # noqa: E402
 class Console:
     """A console process on an ephemeral port, wired to a fresh demo WAF."""
 
+    #: Sent on every request unless a test passes `token=` explicitly. None means
+    #: "no Authorization header at all".
+    default_token = None
+
     def __init__(self) -> None:
         self.waf, self.target = demo_waf.start_demo_waf()
         host = self.target.split("//", 1)[1].split("/", 1)[0].split(":")[0]
@@ -55,13 +59,19 @@ class Console:
         self.server.server_close()
         self.waf.stop()
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, token=None, origin=None):
+        """`token=None` uses the console's default; `token=""` sends none."""
         url = self.base + path
         data = None
         headers = {}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        presented = self.default_token if token is None else token
+        if presented is not None:
+            headers["Authorization"] = f"Bearer {presented}"
+        if origin:
+            headers["Origin"] = origin
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -705,3 +715,194 @@ def test_a_failed_start_does_not_leak_an_admission_slot(monkeypatch):
 
     # The slot is still available: a legitimate run can be admitted.
     service._admission.acquire(timeout=0.1)
+
+
+# --------------------------------------------------------------------------
+# hardening: secure bind default, auth, Origin, rate limit, readiness
+# --------------------------------------------------------------------------
+
+
+class AuthedConsole(Console):
+    """The same console, with a bearer token required on every API route."""
+
+    TOKEN = "test-token-value"
+    default_token = TOKEN
+
+    def __init__(self) -> None:
+        self.waf, self.target = demo_waf.start_demo_waf()
+        host = self.target.split("//", 1)[1].split("/", 1)[0].split(":")[0]
+        self.service = AuditService(allowed_hosts=[host], demo_target=self.target)
+        self.server = make_server("127.0.0.1", 0, self.service, auth_token=self.TOKEN)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+
+@pytest.fixture
+def authed():
+    c = AuthedConsole()
+    try:
+        yield c
+    finally:
+        c.stop()
+
+
+def test_health_stays_open_when_a_token_is_required(authed):
+    """A probe cannot present a credential, so health must not need one."""
+    status, _, _ = authed.request("GET", "/api/health")
+    assert status == 200
+
+
+def test_the_ui_stays_reachable_when_a_token_is_required(authed):
+    """The page is how a user supplies the token; gating it would be a deadlock."""
+    status, _, _ = authed.request("GET", "/")
+    assert status == 200
+
+
+def test_api_without_a_token_is_401(authed):
+    status, raw, _ = authed.request("GET", "/api/levels", token="")
+    assert status == 401, raw
+    assert "unauthorized" in raw
+
+
+def test_an_empty_bearer_value_does_not_authenticate(authed):
+    """`Authorization: Bearer` with nothing after it must not be read as a match."""
+    status, _, _ = authed.request("GET", "/api/levels", token=" ")
+    assert status == 401
+
+
+def test_api_with_a_wrong_token_is_401(authed):
+    status, _, _ = authed.request("GET", "/api/levels", token="not-the-token")
+    assert status == 401
+
+
+def test_api_with_the_token_is_allowed(authed):
+    status, raw, _ = authed.request("GET", "/api/levels", token=authed.TOKEN)
+    assert status == 200, raw
+
+
+def test_a_cross_origin_post_is_refused(console):
+    """
+    Without this, any page a visitor loads can drive the console from their
+    browser. The scope gate limits the damage but does not make it authorized.
+    """
+    status, raw, _ = console.request(
+        "POST", "/api/audits", {}, origin="https://evil.example.net"
+    )
+    assert status == 403, raw
+    assert "cross-origin" in raw
+
+
+def test_a_same_origin_post_is_allowed(console):
+    status, raw, _ = console.request(
+        "POST", "/api/audits",
+        {"max_level": 0, "visitor_count": 1, "duration_hours": 0.002},
+        origin=console.base,
+    )
+    assert status == 202, raw
+
+
+def test_a_request_without_an_origin_is_allowed(console):
+    """curl and scripts are not CSRF; the bind/token governs those."""
+    status, raw, _ = console.request("GET", "/api/health")
+    assert status == 200
+
+
+def test_readiness_is_200_when_a_slot_is_free(console):
+    status, raw, _ = console.request("GET", "/api/health/ready")
+    assert status == 200, raw
+    assert json.loads(raw)["ready"] is True
+
+
+def test_readiness_is_503_when_every_slot_is_held(console):
+    """
+    Liveness says the process is up; readiness says it can serve. Routing to a
+    full console is what turns a saturated service into a wave of 503s that read
+    like a bug.
+    """
+    for _ in range(3):
+        console.service._admission.acquire()
+    try:
+        status, raw, _ = console.request("GET", "/api/health/ready")
+        assert status == 503, raw
+        body = json.loads(raw)
+        assert body["ready"] is False
+        assert any("slots" in b for b in body["blockers"])
+    finally:
+        for _ in range(3):
+            console.service._admission.release()
+
+
+def test_readiness_names_every_blocker(console):
+    """A caller should be told what to wait for, not just 'not ready'."""
+    console.service.demo_target = ""
+    console.service.allowed_hosts = []
+    status, raw, _ = console.request("GET", "/api/health/ready")
+    assert status == 503
+    assert any("nothing may be audited" in b for b in json.loads(raw)["blockers"])
+
+
+def test_the_rate_limit_refuses_after_the_budget(console):
+    """The brake exists because the semaphore bounds concurrency, not rate."""
+    from console.runs import RATE_LIMIT_PER_ROUTE
+
+    budget = RATE_LIMIT_PER_ROUTE["/api/proxy"]
+    for _ in range(budget):
+        status, raw, _ = console.request("POST", "/api/proxy", {"clear": True})
+        assert status == 200, "a request inside the budget must not be limited"
+    status, raw, _ = console.request("POST", "/api/proxy", {"clear": True})
+    assert status == 429, raw
+    assert "rate limit" in raw
+
+
+def test_readiness_reads_are_never_rate_limited(console):
+    """Polling is the normal case and must stay cheap."""
+    for _ in range(80):
+        status, _, _ = console.request("GET", "/api/health/ready")
+        assert status == 200
+
+
+def test_eviction_never_drops_a_running_session(console):
+    """
+    Evicting by age discarded in-flight results: a 21st audit deleted the 1st's
+    session while it was still running, and its caller got a 404 for a live audit.
+    """
+    from console.runs import AuditSession
+
+    with console.service._lock:
+        console.service._sessions.clear()
+        live = AuditSession(
+            id="live-one", target_url=console.target, visitor_count=1,
+            duration_hours=0.01, max_level=0, seed=1,
+        )
+        console.service._sessions[live.id] = live
+        for i in range(console.service._cap + 5):
+            done = AuditSession(
+                id=f"done-{i}", target_url=console.target, visitor_count=1,
+                duration_hours=0.01, max_level=0, seed=1, status="done",
+            )
+            done.started_at = 100 + i
+            console.service._sessions[done.id] = done
+        console.service._evict_locked()
+        assert "live-one" in console.service._sessions
+        assert len(console.service._sessions) <= console.service._cap
+
+
+def test_exposed_bind_without_a_token_is_refused():
+    """
+    A secure default is cheaper than a documented caveat.
+
+    The console refuses to bind an exposed address without a token, rather than
+    starting exposed and relying on the operator to have read the README.
+    """
+    import app as console_app
+
+    assert console_app.main(["--host", "0.0.0.0", "--port", "0"]) == 2
+
+
+def test_loopback_bind_is_the_default():
+    import app as console_app
+
+    args = console_app._parse_args([])
+    assert args.host == "127.0.0.1"
+    assert args.auth_token == ""
