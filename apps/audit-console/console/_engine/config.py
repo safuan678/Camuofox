@@ -20,7 +20,7 @@ launched from the CLI, from the GUI, or from a saved profile.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from .detection import Verdict
@@ -174,6 +174,31 @@ class AuditConfig:
     #: types; the CTR roll compares it against `uniform(0, 100)`. Bounded to
     #: [0, 30] by `__post_init__`.
     outbound_campaign_rate_pct: float = 2.5
+    #: Derive the global request ceiling from the traffic plan instead of using
+    #: `limits.max_requests`, which the GUI no longer asks for.
+    #:
+    #: A hand-set global ceiling was a second, disconnected number: it had to be
+    #: guessed larger than the plan, and guessing it wrong either cut a run off
+    #: partway (silently, as an abort) or left it so high it protected nothing.
+    #: The plan already states what the run intends to send, so the ceiling is
+    #: computed from it -- see `resolved_limits()`.
+    auto_scale_ceiling: bool = False
+    #: Traffic the funnel's own click-throughs may add, beyond the page budget.
+    #:
+    #: A click-through is not one request: the banner hop, the landing page, and
+    #: whatever the landing page pulls, plus the redirect chain and any network
+    #: retry. Budgeted at a flat multiplier of the clicking population rather than
+    #: folded into the per-visitor page cap, because the CTR is deliberately
+    #: independent of that cap -- a visitor that clicks is not spending its
+    #: one-of-N pages on the campaign destination.
+    outbound_request_multiplier: float = 3.0
+    #: Headroom added to the derived ceiling, as a fraction of the visitor count.
+    #:
+    #: 0.10 means a hundred extra requests per thousand visitors. It absorbs the
+    #: requests a run cannot predict -- multi-hop redirects, retries after a
+    #: timeout, a browser pulling assets the census does not enumerate -- so the
+    #: ceiling stops a runaway without tripping on a correct run.
+    ceiling_headroom_fraction: float = 0.10
     #: Whether banner discovery may look inside child frames.
     #:
     #: Many real campaigns are served from an ad iframe, so a main-frame-only
@@ -207,6 +232,82 @@ class AuditConfig:
         except ValueError:
             if self.enable_outbound_funnel:
                 raise
+
+    def resolved_limits(self) -> SafetyLimits:
+        """
+        The ceilings the runner actually enforces.
+
+        With `auto_scale_ceiling` off this is `self.limits` untouched, so a CLI run
+        or a saved profile that names its own ceiling keeps behaving exactly as it
+        did. With it on, the global request ceiling is derived from the plan:
+
+            (visitors * max_requests_per_visitor)
+          + (visitors * (CTR / 100) * outbound_request_multiplier)
+          + (visitors * ceiling_headroom_fraction)
+
+        The first term is the page budget: every visitor may make up to N page
+        requests. The second is the funnel's own traffic, sized from the clicking
+        population -- the CTR decides *who clicks*, and the multiplier pays for the
+        hop, the landing page and its assets. The third is headroom so a correct
+        run does not trip the ceiling on redirects and retries.
+
+        Deriving rather than asking is the point. The numbers are already in the
+        plan, and a hand-set ceiling that disagreed with them either cut the run
+        short or protected nothing. The per-visitor cap still bounds any single
+        journey, so this ceiling bounds the run as a whole without limiting what
+        one visitor may do.
+
+        A run that would derive a ceiling below its own plan cannot happen: the
+        formula's first term is the plan's own maximum, so the result is always at
+        least `visitors * N`.
+        """
+        if not self.auto_scale_ceiling:
+            return self.limits
+        per_visitor = max(0, int(self.journey.max_requests_per_visitor))
+        pages = max(0, self.visitor_count) * per_visitor
+        clicks = (
+            # Single-rung mode pins the visitor count, and `__post_init__` has
+            # already applied that, so this reads the count the run will use.
+            max(0, self.visitor_count)
+            * (max(0.0, float(self.outbound_campaign_rate_pct)) / 100.0)
+        )
+        if not self.enable_outbound_funnel:
+            clicks = 0.0
+        funnel = clicks * max(0.0, float(self.outbound_request_multiplier))
+        headroom = max(0, self.visitor_count) * max(0.0, float(self.ceiling_headroom_fraction))
+        derived = int(pages + funnel + headroom)
+        # A plan that derives zero (no visitors, or no per-visitor budget) would
+        # otherwise hand the limiter "0", which it reads as *unlimited*. That is
+        # the one direction this must never fail in, so force a floor.
+        if derived <= 0:
+            derived = max(1, max(0, self.visitor_count))
+        return replace(self.limits, max_requests=derived)
+
+    def ceiling_breakdown(self) -> Dict[str, int]:
+        """
+        The derived ceiling's terms, for the log and the report.
+
+        An operator who sees the run stop at a number they did not type needs to
+        see where it came from, or the ceiling reads as a bug.
+        """
+        per_visitor = max(0, int(self.journey.max_requests_per_visitor))
+        visitors = max(0, self.visitor_count)
+        pages = visitors * per_visitor
+        clicks = (
+            visitors * (max(0.0, float(self.outbound_campaign_rate_pct)) / 100.0)
+            if self.enable_outbound_funnel
+            else 0.0
+        )
+        funnel = int(clicks * max(0.0, float(self.outbound_request_multiplier)))
+        headroom = int(visitors * max(0.0, float(self.ceiling_headroom_fraction)))
+        return {
+            "visitors": visitors,
+            "requests_per_visitor": per_visitor,
+            "pages": pages,
+            "funnel_requests": funnel,
+            "headroom": headroom,
+            "total": pages + funnel + headroom,
+        }
 
     def selected_levels(self) -> List[EvasionLevel]:
         if self.single_level_mode:
@@ -269,10 +370,11 @@ class AuditConfig:
                 f"be given; pass one or the other. Remove levels to run only "
                 f"L{self.single_level}."
             )
-        if self.visitor_count > self.limits.max_requests > 0:
+        if self.visitor_count > self.resolved_limits().max_requests > 0:
             problems.append(
                 f"visitor_count ({self.visitor_count}) exceeds max_requests "
-                f"({self.limits.max_requests}); the audit would be cut off partway"
+                f"({self.resolved_limits().max_requests}); the audit would be cut "
+                f"off partway"
             )
         if self.enable_outbound_funnel:
             try:
@@ -304,6 +406,8 @@ class AuditConfig:
             "single_level": self.single_level,
             "enable_outbound_funnel": self.enable_outbound_funnel,
             "outbound_campaign_rate_pct": self.outbound_campaign_rate_pct,
+            "auto_scale_ceiling": self.auto_scale_ceiling,
+            "ceiling_breakdown": self.ceiling_breakdown() if self.auto_scale_ceiling else None,
             "include_iframes": self.include_iframes,
             "visitor_count": self.visitor_count,
             "duration_hours": self.duration_hours,

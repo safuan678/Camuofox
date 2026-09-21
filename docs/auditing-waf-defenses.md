@@ -253,8 +253,16 @@ defense you are trying to measure, and you would learn nothing about your own si
 ## Scope and authorization
 
 - A target must be named in the scope **and** acknowledged. There is no bypass flag.
+- The GUI derives the scope from the target URL and acknowledges it on the
+  operator's behalf when they start a run, so the only scope decision they make is
+  whether subdomains are included. The CLI keeps the explicit
+  `--i-am-authorized` flag; the engine's gate still reads `scope.acknowledged`.
 - Scope matching is exact host plus explicitly listed subdomains. `example.com`
   does not authorize `api.example.com`, and `evil-example.com` is never matched.
+- Excluding subdomains collapses the journey to one page, because "no subdomains"
+  means the target is a single static page. The per-visitor request cap is pinned
+  to 1 to match, so the run cannot spend its budget looking for links the scope
+  will not let it follow.
 - Every navigation passes the scope check, so a redirect or an off-site link cannot
   pull the audit somewhere it was not authorized to go.
 - Only `http` and `https` targets are accepted.

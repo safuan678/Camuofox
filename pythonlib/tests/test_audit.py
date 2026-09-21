@@ -3150,3 +3150,195 @@ def test_artifacts_are_recorded_on_the_level(waf_server, tmp_path):
     assert recorded, "the level did not record the artifacts it wrote"
     assert all(Path(a).exists() for a in recorded)
     assert len(recorded) == len(set(recorded)), "an artifact was recorded twice"
+
+
+# --------------------------------------------------------------------------
+# Scope derived from the target, and the plan-derived ceiling
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("example.com", "example.com"),
+        ("staging.example.com", "example.com"),
+        ("example.co.uk", "example.co.uk"),
+        ("blog.example.co.uk", "example.co.uk"),
+        ("foo.bar.com", "bar.com"),
+        ("a.b.example.com.au", "example.com.au"),
+        # A literal has no labels to strip, so it stays whole. Scoping 203.0.113.7
+        # to the last two labels would name "0.113.7", which is not a host.
+        ("203.0.113.7", "203.0.113.7"),
+        ("localhost", "localhost"),
+    ],
+)
+def test_the_registrable_domain_is_the_site_not_the_leaf(host, expected):
+    from camoufox.audit import registrable_domain
+
+    assert registrable_domain(host) == expected
+
+
+def test_a_string_that_is_not_a_host_derives_nothing():
+    """
+    `urlparse` returns `not a url` for `//not a url`, so the derived value is
+    validated rather than trusted. An audit scoped to a non-resolving string would
+    claim a scope it never had.
+    """
+    from camoufox.audit import registrable_domain
+
+    for value in ("", "   ", "not a url", "-bad.com", "a..b"):
+        assert registrable_domain(value) == ""
+
+
+def test_for_target_scopes_to_the_main_domain_by_default():
+    scope = TargetScope.for_target("https://staging.example.com/pricing")
+    assert scope.hosts == ["example.com"]
+    assert scope.permits("blog.example.com")
+    assert not scope.permits("evil.example.net")
+
+
+def test_for_target_keeps_a_subdomain_target_in_scope_when_subdomains_are_off():
+    """
+    The audit must not refuse the one URL the operator named.
+
+    Scoping `staging.example.com` down to `example.com` with subdomains off would
+    make the gate reject the arrival page, and the run would report OUT_OF_SCOPE
+    for its own target.
+    """
+    scope = TargetScope.for_target(
+        "https://staging.example.com/", include_subdomains=False
+    )
+    assert "example.com" in scope.hosts
+    assert "staging.example.com" in scope.hosts
+    assert scope.permits("staging.example.com")
+    assert not scope.permits("blog.example.com")
+
+
+def test_for_target_rejects_a_hostless_target():
+    with pytest.raises(ValueError, match="Could not parse a host"):
+        TargetScope.for_target("not a url")
+
+
+def test_uniform_pages_max_draws_a_mix_of_session_lengths():
+    """
+    A population of identical journeys is its own signature.
+
+    With a ceiling of 5 every visitor draws uniformly from 1..5, so the observed
+    page counts must spread across the range rather than clustering on one value.
+    """
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    config = replace(JourneyConfig(), uniform_pages_max=5, max_requests_per_visitor=5)
+    counts = {
+        plan_visit(config, random.Random(seed), behavior=True).page_count
+        for seed in range(200)
+    }
+    assert counts == {1, 2, 3, 4, 5}
+
+
+def test_uniform_pages_max_never_exceeds_the_per_visitor_cap():
+    """The plan must not promise more pages than the runner will allow."""
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    config = replace(JourneyConfig(), uniform_pages_max=50, max_requests_per_visitor=3)
+    for seed in range(100):
+        assert plan_visit(config, random.Random(seed), behavior=True).page_count <= 3
+
+
+def test_a_one_page_draw_is_planned_as_a_bounce():
+    """
+    A single-page draw *is* a bounce, and must be planned as one.
+
+    Reading it as an abandoned multi-page session would give it a long dwell,
+    which is the opposite of what a one-page visit is.
+    """
+    from camoufox.audit.journey import JourneyConfig, plan_visit
+
+    config = replace(JourneyConfig(), uniform_pages_max=1, max_requests_per_visitor=1)
+    plan = plan_visit(config, random.Random(3), behavior=True)
+    assert plan.page_count == 1
+    assert plan.is_bounce
+
+
+def test_the_derived_ceiling_is_the_plan_arithmetic():
+    """
+    1000 visitors, N=5, 2.5% CTR, 3x funnel multiplier, 10% headroom:
+
+        5000 page + floor(1000 * 0.025 * 3) funnel + 100 headroom = 5175
+
+    The funnel term is sized from the clicking population because the CTR is
+    independent of the per-visitor cap -- a visitor that clicks is not spending its
+    one-of-N pages on the campaign hop.
+    """
+    config = replace(
+        _config("https://example.com/"),
+        visitor_count=1000,
+        enable_outbound_funnel=True,
+        auto_scale_ceiling=True,
+        journey=replace(JourneyConfig(), max_requests_per_visitor=5),
+    )
+    parts = config.ceiling_breakdown()
+    assert parts == {
+        "visitors": 1000,
+        "requests_per_visitor": 5,
+        "pages": 5000,
+        "funnel_requests": 75,
+        "headroom": 100,
+        "total": 5175,
+    }
+    assert config.resolved_limits().max_requests == 5175
+
+
+def test_the_funnel_is_not_budgeted_when_it_is_off():
+    """A closed funnel sends no clicks, so paying for them would inflate the budget."""
+    config = replace(
+        _config("https://example.com/"),
+        visitor_count=100,
+        enable_outbound_funnel=False,
+        auto_scale_ceiling=True,
+        journey=replace(JourneyConfig(), max_requests_per_visitor=4),
+    )
+    assert config.ceiling_breakdown()["funnel_requests"] == 0
+
+
+def test_auto_scale_off_keeps_the_named_ceiling():
+    """A caller that sets its own ceiling must still get exactly that."""
+    limits = SafetyLimits(max_requests=777, max_rps=50, max_concurrency=1)
+    config = replace(_config("https://example.com/"), limits=limits)
+    assert config.auto_scale_ceiling is False
+    assert config.resolved_limits().max_requests == 777
+
+
+def test_the_derived_ceiling_is_at_least_the_page_budget():
+    """
+    The ceiling can never cut off the run's own plan.
+
+    The first term of the formula is the plan's maximum, so a derived ceiling
+    below `visitors * N` is impossible -- which is the property that makes
+    deriving it safe rather than a risk of silently truncating a run.
+    """
+    config = replace(
+        _config("https://example.com/"),
+        visitor_count=500,
+        auto_scale_ceiling=True,
+        journey=replace(JourneyConfig(), max_requests_per_visitor=6),
+    )
+    assert config.resolved_limits().max_requests >= 500 * 6
+
+
+def test_the_runner_enforces_the_resolved_ceiling(waf_server):
+    """
+    The engine must read the derived number, not the raw field.
+
+    With auto-scaling on and a raw ceiling that differs from the derived one, the
+    limiter has to carry the derived value or the feature is cosmetic.
+    """
+    config = _config(
+        waf_server,
+        visitor_count=20,
+        auto_scale_ceiling=True,
+        journey=replace(JourneyConfig(), max_requests_per_visitor=3),
+    )
+    runner = AuditRunner(config)
+    assert runner._limiter.max_requests == config.resolved_limits().max_requests
+    assert runner._limiter.max_requests >= 20 * 3

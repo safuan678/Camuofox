@@ -456,7 +456,12 @@ class AuditRunner:
         self._on_progress = on_progress
         self._cancel = cancel_event
         self._rng = random.Random(config.seed)
-        self._limiter = _Limiter(config.limits.max_rps, config.limits.max_requests)
+        # The resolved ceilings, not the raw ones: with `auto_scale_ceiling` on the
+        # global request budget is derived from the traffic plan (see
+        # `AuditConfig.resolved_limits`). Resolved once, here, so every enforcement
+        # point reads the same number.
+        self._limits = config.resolved_limits()
+        self._limiter = _Limiter(self._limits.max_rps, self._limits.max_requests)
         self._proxy_counts: Dict[str, int] = {}
         self._consecutive_errors = 0
         self._virtual_display_used = False
@@ -722,7 +727,7 @@ class AuditRunner:
         """
         if self._rotator is None:
             return None, None
-        cap = self.config.limits.max_per_proxy
+        cap = self._limits.max_per_proxy
         for _ in range(8):
             session = self._rotator.acquire_session()
             if session is None:
@@ -1845,7 +1850,7 @@ class AuditRunner:
         )
 
         started_at = time.time()
-        semaphore = asyncio.Semaphore(max(1, self.config.limits.max_concurrency))
+        semaphore = asyncio.Semaphore(max(1, self._limits.max_concurrency))
 
         # One browser for the whole rung, when reuse is on. Opened before any
         # visitor is scheduled so the launch cost is paid once, and released after
@@ -1903,9 +1908,9 @@ class AuditRunner:
                     else:
                         self._consecutive_errors = 0
                     if (
-                        self.config.limits.abort_after_consecutive_errors
+                        self._limits.abort_after_consecutive_errors
                         and self._consecutive_errors
-                        >= self.config.limits.abort_after_consecutive_errors
+                        >= self._limits.abort_after_consecutive_errors
                     ):
                         lr.aborted = True
                         lr.abort_reason = (

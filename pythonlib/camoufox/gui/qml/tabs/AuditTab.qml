@@ -84,27 +84,65 @@ Item {
                             onTextChanged: auditBackend.setTarget(text)
                         }
 
-                        Header {
-                            Layout.leftMargin: Theme.s3
-                            text: "AUTHORIZED HOSTS"
-                        }
-                        Input {
+                        // The authorized scope is derived from the target URL, not
+                        // typed: there is no "Authorized hosts" field by design.
+                        // It is shown instead, because a scope the operator cannot
+                        // see is a scope they cannot check.
+                        RowLayout {
                             Layout.leftMargin: Theme.s3
                             Layout.rightMargin: Theme.s3
                             Layout.fillWidth: true
-                            placeholder: "example.com"
-                            Component.onCompleted: text = auditBackend.scopeHosts
-                            onTextChanged: auditBackend.setScopeHosts(text)
+                            spacing: Theme.s2
+                            Header { text: "AUDITED SCOPE" }
+                            Item { Layout.fillWidth: true }
+                            Tag {
+                                text: auditBackend.derivedHost ? auditBackend.derivedHost : "derived from target"
+                                accent: auditBackend.derivedHost ? Theme.accent : Theme.muted
+                            }
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: auditBackend.scopeDescription
+                        }
+
+                        Header {
+                            Layout.leftMargin: Theme.s3
+                            text: "SUBDOMAINS"
                         }
                         RowLayout {
                             Layout.leftMargin: Theme.s3
                             spacing: Theme.s2
-                            CheckBox {
-                                id: subdomainsBox
+                            RadioButton {
+                                id: includeSubs
                                 text: "Include subdomains"
-                                checked: auditBackend.allowSubdomains
-                                onToggled: auditBackend.setAllowSubdomains(checked)
+                                checked: auditBackend.includeSubdomains
+                                onToggled: if (checked) auditBackend.setIncludeSubdomains(true)
                             }
+                            RadioButton {
+                                id: excludeSubs
+                                text: "Exclude subdomains"
+                                checked: auditBackend.subdomainsExcluded
+                                onToggled: if (checked) auditBackend.setSubdomainsExcluded(true)
+                            }
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            visible: auditBackend.includeSubdomains
+                            text: "Visitors browse the main site and its subdomains. Each visitor's page count is drawn as a random 1..N, so the population is a mix of short and long sessions."
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            visible: auditBackend.subdomainsExcluded
+                            text: "Static page: subdomains are out of scope and each visitor loads only the target, once. Max requests / visitor is pinned to 1."
                         }
 
                         Header {
@@ -176,38 +214,18 @@ Item {
                             onTextChanged: auditBackend.setCampaignRatePct(text)
                         }
 
-                        // Authorization gate
-                        Rectangle {
+                        // No authorization checkbox and no ticket field: starting
+                        // the audit is the acknowledgment. The note below states
+                        // what the run will record, so the state is still visible
+                        // rather than merely assumed.
+                        Muted {
                             Layout.leftMargin: Theme.s3
                             Layout.rightMargin: Theme.s3
                             Layout.fillWidth: true
-                            implicitHeight: ackCol.implicitHeight + Theme.s3 * 2
-                            color: auditBackend.acknowledged ? "#1e2a1e" : "#2a1e1e"
-                            radius: Theme.s1
-                            border.color: auditBackend.acknowledged ? Theme.ok : Theme.err
-                            border.width: 1
-
-                            ColumnLayout {
-                                id: ackCol
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.margins: Theme.s2
-                                spacing: Theme.s1
-
-                                CheckBox {
-                                    id: ackBox
-                                    text: "I am authorized to test this target"
-                                    checked: auditBackend.acknowledged
-                                    onToggled: auditBackend.setAcknowledged(checked)
-                                }
-                                Input {
-                                    Layout.fillWidth: true
-                                    placeholder: "Ticket / approval reference"
-                                    Component.onCompleted: text = auditBackend.acknowledgmentNote
-                                    onTextChanged: auditBackend.setAcknowledgmentNote(text)
-                                }
-                            }
+                            wrapMode: Text.WordWrap
+                            text: "Starting the audit authorizes it and records the approval as \""
+                                  + auditBackend.acknowledgmentNote
+                                  + "\". Only audit a site you own or have written permission to test."
                         }
 
                         Rule {
@@ -292,9 +310,23 @@ Item {
                             Input {
                                 Layout.fillWidth: true
                                 text: auditBackend.maxRequestsPerVisitor
+                                // Pinned to 1 when subdomains are excluded: a
+                                // static page is one page per visitor, so an
+                                // editable N there would promise journeys the
+                                // scope cannot deliver. The backend clamps it too,
+                                // since a disabled field is not an enforcement.
+                                enabled: !auditBackend.maxRequestsPerVisitorLocked
+                                opacity: enabled ? 1.0 : 0.5
                                 input.validator: IntValidator { bottom: 1; top: 10000 }
                                 onEditingFinished: if (text.length) auditBackend.setMaxRequestsPerVisitor(parseInt(text))
                             }
+                        }
+                        Muted {
+                            Layout.leftMargin: Theme.s3
+                            Layout.rightMargin: Theme.s3
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            text: auditBackend.maxRequestsPerVisitorHint
                         }
 
                         Header {
@@ -541,12 +573,17 @@ Item {
                             columnSpacing: Theme.s2
                             rowSpacing: Theme.s1
 
-                            Muted { text: "Max requests" }
-                            Input {
+                            // The global request ceiling is derived from the traffic
+                            // plan, not typed: the numbers it needs are already
+                            // above, so a second field could only disagree with
+                            // them. Shown rather than editable, with its terms, so
+                            // a run stopping here does not read as a bug.
+                            Muted { text: "Max requests (derived)" }
+                            Muted {
+                                id: ceilingValue
                                 Layout.fillWidth: true
-                                text: auditBackend.maxRequests
-                                input.validator: IntValidator { bottom: 0; top: 100000000 }
-                                onEditingFinished: if (text.length) auditBackend.setMaxRequests(parseInt(text))
+                                color: Theme.fg
+                                text: auditBackend.safetyCeilingSummary ? auditBackend.safetyCeilingSummary : "set a target and visitors to derive"
                             }
 
                             Muted { text: "Max requests/sec" }

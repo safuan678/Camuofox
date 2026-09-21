@@ -14,6 +14,7 @@ security control; this is the control.
 from __future__ import annotations
 
 import ipaddress
+import re
 from dataclasses import dataclass, field
 from typing import List, Sequence, Set
 from urllib.parse import urlparse
@@ -22,7 +23,61 @@ __all__ = [
     "ScopeViolation",
     "AuthorizationRequired",
     "TargetScope",
+    "registrable_domain",
 ]
+
+#: Second-level labels that are part of a registry's own structure rather than a
+#: site's name, under a two-letter country code.
+#:
+#: `example.co.uk` is one site whose registrable domain is the last three labels,
+#: not `co.uk`; `blog.example.co.uk` belongs to `example.co.uk`. Resolving this
+#: needs the Public Suffix List, which is a data file this package does not ship
+#: and will not fetch at import time. The token list below covers the structures
+#: that actually appear in audit targets, and the fallback (last two labels) is
+#: correct for every plain TLD -- so an unlisted oddity degrades to the
+#: two-label answer rather than to something wrong in a way that widens scope.
+_MULTI_PART_SLD_TOKENS = frozenset(
+    {
+        "ac", "asn", "co", "com", "edu", "firm", "gen", "go", "gob", "govern",
+        "gov", "govt", "gr", "id", "idv", "ind", "in", "kiwi", "lg", "ltd",
+        "maori", "med", "me", "mil", "muni", "ne", "net", "nhs", "or", "org",
+        "pe", "per", "plc", "re", "res", "sch", "school", "sc", "web",
+    }
+)
+
+
+def registrable_domain(host: str) -> str:
+    """
+    The main domain `host` belongs to -- what an operator means by "the site".
+
+    A target of `https://staging.example.co.uk/pricing` names `example.co.uk`.
+    Deriving this rather than asking for it is what lets the GUI infer the
+    authorized host from the target URL alone: the operator names the page they
+    want audited, and the site it lives on follows from it.
+
+    IP literals are returned unchanged -- a literal has no domain structure, and
+    stripping labels off `203.0.113.7` would invent a scope that does not exist.
+    A single-label host (`localhost`) is returned unchanged for the same reason.
+    """
+    host = _normalize_host(host)
+    if not host:
+        return ""
+    if _is_ip_literal(host):
+        return host
+    if not _is_valid_hostname(host):
+        # Not a host at all -- `//not a url` yields "not a url" from `urlparse`.
+        # Returning "" rather than the input keeps a caller from scoping an audit
+        # to a string that cannot resolve; `for_target` turns that into an error.
+        return ""
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    # Only a two-letter final label can be a country code, and only a country code
+    # has the registry's own structure in front of the site's name. A three-label
+    # `.com` host is `foo.bar.com`, whose registrable domain is `bar.com`.
+    if len(labels[-1]) == 2 and labels[-2] in _MULTI_PART_SLD_TOKENS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
 
 
 class ScopeViolation(RuntimeError):
@@ -46,6 +101,18 @@ def _is_ip_literal(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+#: A hostname is dot-separated labels of letters, digits and inner hyphens. The
+#: check exists because `urlparse` is permissive: it happily returns `not a url`
+#: as the hostname of `//not a url`, and an audit scoped to a string with spaces
+#: in it would then claim a host that cannot resolve.
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                          r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+
+def _is_valid_hostname(host: str) -> bool:
+    return bool(host) and bool(_HOSTNAME_RE.match(host))
 
 
 @dataclass
@@ -85,6 +152,57 @@ class TargetScope:
         ]
 
     # -- construction ------------------------------------------------------
+
+    @classmethod
+    def for_target(
+        cls,
+        target_url: str,
+        *,
+        include_subdomains: bool = True,
+        acknowledged: bool = True,
+        acknowledgment_note: str = "",
+        exclude_urls: Sequence[str] = (),
+    ) -> "TargetScope":
+        """
+        Derive the scope from the one URL the operator actually named.
+
+        The authorized host is not a second thing to type: it is a property of the
+        target. Asking for both invited the two to disagree -- a target on
+        `staging.example.com` scoped to `example.com` would have the audit refused
+        its own arrival page -- and it made the common case two fields instead of
+        one. Deriving it here means GUI and CLI cannot drift apart on the rule.
+
+        `include_subdomains` is the operator's answer to a real question: whether
+        they are auditing one page or a site. A static single page has no
+        subdomains to wander into, which is why the GUI pairs it with a one-page
+        journey (see `JourneyConfig`).
+        """
+        host = urlparse(
+            target_url if "//" in target_url else f"//{target_url}"
+        ).hostname or ""
+        # `urlparse` is permissive enough to hand back `not a url` for `//not a
+        # url`, so the derived host is validated rather than trusted. An audit
+        # scoped to a string that cannot resolve would report a scope it never had.
+        if not host or not (_is_valid_hostname(host) or _is_ip_literal(host)):
+            raise ValueError(f"Could not parse a host out of {target_url!r}")
+        # The target's own host must be in scope even in the no-subdomains mode
+        # and even when it sits on a subdomain. Without it, a target of
+        # `https://staging.example.com/` scoped to `example.com` with subdomains
+        # off would have the gate refuse the audit's own arrival page -- the run
+        # would report OUT_OF_SCOPE for the one URL the operator asked about.
+        # With subdomains allowed the main domain already covers it, so listing it
+        # again would only make the scope read as two hosts when it is one site.
+        main = registrable_domain(host)
+        hosts = [main]
+        if not include_subdomains and host != main:
+            hosts.append(host)
+        return cls.from_urls(
+            hosts,
+            allow_subdomains=include_subdomains,
+            acknowledged=acknowledged,
+            acknowledgment_note=acknowledgment_note,
+            exclude_urls=exclude_urls,
+        )
 
     @classmethod
     def from_urls(

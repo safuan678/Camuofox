@@ -43,6 +43,7 @@ from ..audit import (
     TargetScope,
     build_schedule,
     parse_rate_pct,
+    registrable_domain,
 )
 from ..audit.detection import Verdict as _Verdict
 from ..audit.report import build_findings, render_text, write_report
@@ -64,6 +65,15 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 #: a run is what made the window grow without bound.
 _LOG_WINDOW_S = 2 * 60 * 60
 _LOG_MAX_LINES = 5000
+
+#: The audit is authorized at the moment the operator clicks Start.
+#:
+#: There is no ticket field and no checkbox: the GUI records the acknowledgment
+#: itself, with this note, and the engine's gate still requires one -- the scope
+#: check in `TargetScope.check` is unchanged, so a run that reached it without an
+#: acknowledgment would still be refused. What is removed is the *prompt*, not the
+#: control.
+AUTO_ACKNOWLEDGMENT_NOTE = "Auto-Authorized via GUI"
 
 
 _VERDICT_COLOR = {
@@ -298,11 +308,16 @@ class AuditBackend(QObject):
 
         # --- target / scope ---------------------------------------------
         self._target = ""
-        self._scope_hosts = ""
         self._exclude_hosts = ""
-        self._allow_subdomains = False
-        self._acknowledged = False
-        self._ack_note = ""
+        #: Whether subdomains of the target's main domain are in scope. On by
+        #: default: the common audit is a site, and a site is more than its apex.
+        #: Off means the operator has told us this is a single static page, which
+        #: is why off also pins the per-visitor journey to one page.
+        self._include_subdomains = True
+        #: The audit is auto-authorized: the GUI starts it on the operator's click
+        #: with no separate checkbox. See `acknowledged`.
+        self._acknowledged = True
+        self._ack_note = AUTO_ACKNOWLEDGMENT_NOTE
 
         # --- outbound funnel ---------------------------------------------
         self._enable_funnel = False
@@ -316,7 +331,6 @@ class AuditBackend(QObject):
         self._max_level = 3
         self._single_level_mode = False
         self._single_level = 5
-        self._max_requests = 5000
         self._max_rps = 5.0
         self._max_concurrency = 4
         self._max_per_minute = 30
@@ -340,6 +354,11 @@ class AuditBackend(QObject):
         #: Where per-rung screenshots and HTML are written. Empty = none.
         self._artifact_dir = ""
         #: Extra with-headers ceiling applied to a single visitor's journey.
+        #:
+        #: This is the operator's "Max requests / visitor": when subdomains are in
+        #: scope it is the *top* of a uniform 1..N draw, so a population of
+        #: visitors makes mixed-length journeys. When they are not, the journey is
+        #: pinned to one page and this reads 1.
         self._max_requests_per_visitor = 12
         #: Force headless for every browser rung. False (the default) honours each
         #: rung's own posture, which is what lets L1 be headless and L2 headful;
@@ -405,10 +424,20 @@ class AuditBackend(QObject):
         return bool(
             not self._running
             and self._target
-            and self._acknowledged
-            and self._scope_hosts.strip()
+            and self._derives_a_host()
             and self._visitors > 0
         )
+
+    def _derives_a_host(self) -> bool:
+        """
+        Whether the target parses into a host the audit could scope to.
+
+        The old gate was "the operator typed something in the hosts field". With
+        the scope derived from the target there is no such field, so the
+        equivalent question is whether the target yields a host at all -- an empty
+        or hostless target has no scope and `for_target` would raise on it.
+        """
+        return bool(self.derivedHost)
 
     # -- target ------------------------------------------------------------
 
@@ -419,35 +448,72 @@ class AuditBackend(QObject):
     @Slot(str)
     def setTarget(self, value: str) -> None:
         self._target = (value or "").strip()
-        # Default the scope to the target's host so the common case is one field.
-        if self._target and not self._scope_hosts.strip():
-            from urllib.parse import urlparse
-
-            parsed = urlparse(self._target if "//" in self._target else f"//{self._target}")
-            if parsed.hostname:
-                self._scope_hosts = parsed.hostname
+        # The authorized host is derived from the target, not typed separately --
+        # see `TargetScope.for_target`. Exposed for display so the operator can
+        # see what the audit will actually be scoped to before starting it.
         self.changed.emit()
         self._refresh_preview()
 
     @Property(str, notify=changed)
-    def scopeHosts(self):
-        return self._scope_hosts
+    def derivedHost(self):
+        """The main domain the target resolves to, or "" when it does not parse."""
+        if not self._target:
+            return ""
+        return registrable_domain(self._target_host())
 
-    @Slot(str)
-    def setScopeHosts(self, value: str) -> None:
-        self._scope_hosts = value or ""
+    @Property(str, notify=changed)
+    def scopeDescription(self):
+        """
+        One line stating what the run will touch, for the operator to check.
+
+        This is the replacement for the old "Authorized hosts" field: the scope is
+        no longer typed, so it has to be *shown*, or the operator is auditing a
+        scope they cannot see.
+        """
+        host = self.derivedHost
+        if not host:
+            return "Enter a target URL to derive the audited scope."
+        if self._include_subdomains:
+            return f"{host} and any subdomain (e.g. blog.{host})"
+        return f"{host} only, as the single page named above"
+
+    def _target_host(self) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(
+            self._target if "//" in self._target else f"//{self._target}"
+        )
+        return parsed.hostname or ""
+
+    @Property(bool, notify=changed)
+    def includeSubdomains(self):
+        return self._include_subdomains
+
+    @Slot(bool)
+    def setIncludeSubdomains(self, value: bool) -> None:
+        """
+        Include the target's subdomains in scope, or treat it as a static page.
+
+        Turning this off is the operator saying "this is one page". A one-page
+        target has no subdomains to wander into, so the per-visitor journey is
+        pinned to a single page and the field is locked in the UI -- letting N
+        stay above 1 there would promise journeys the scope cannot deliver, and
+        the run would spend its budget finding nothing.
+        """
+        self._include_subdomains = bool(value)
+        if not self._include_subdomains:
+            self._max_requests_per_visitor = 1
         self.changed.emit()
         self._refresh_preview()
 
     @Property(bool, notify=changed)
-    def allowSubdomains(self):
-        return self._allow_subdomains
+    def subdomainsExcluded(self):
+        """Inverse of `includeSubdomains`, for the QML's radio binding."""
+        return not self._include_subdomains
 
     @Slot(bool)
-    def setAllowSubdomains(self, value: bool) -> None:
-        self._allow_subdomains = bool(value)
-        self.changed.emit()
-        self._refresh_preview()
+    def setSubdomainsExcluded(self, value: bool) -> None:
+        self.setIncludeSubdomains(not bool(value))
 
     @Property(str, notify=changed)
     def excludeHosts(self):
@@ -490,6 +556,14 @@ class AuditBackend(QObject):
 
     @Property(bool, notify=changed)
     def acknowledged(self):
+        """
+        Whether the run is authorized. Always True in the GUI.
+
+        Kept as a property because the engine's gate and the report both read it,
+        and because the QML shows the authorization state. It is no longer set by
+        a checkbox: the operator's click on Start *is* the acknowledgment, recorded
+        with `AUTO_ACKNOWLEDGMENT_NOTE` when the config is built.
+        """
         return self._acknowledged
 
     @Slot(bool)
@@ -576,15 +650,6 @@ class AuditBackend(QObject):
         self.changed.emit()
 
     @Property(int, notify=changed)
-    def maxRequests(self):
-        return self._max_requests
-
-    @Slot(int)
-    def setMaxRequests(self, value: int) -> None:
-        self._max_requests = max(0, int(value))
-        self.changed.emit()
-
-    @Property(float, notify=changed)
     def maxRps(self):
         return self._max_rps
 
@@ -696,9 +761,67 @@ class AuditBackend(QObject):
 
     @Slot(int)
     def setMaxRequestsPerVisitor(self, value: int) -> None:
-        """Ceiling on requests one visitor's journey may make."""
-        self._max_requests_per_visitor = max(1, int(value))
+        """
+        Top of the per-visitor page draw, or a pinned 1 in static-page mode.
+
+        Clamped at 1 here rather than only in the UI: the QML field is disabled
+        when subdomains are excluded, but a binding is not an enforcement, and the
+        rule ("a static page is one page") has to hold whichever way the value
+        arrives.
+        """
+        if not self._include_subdomains:
+            self._max_requests_per_visitor = 1
+        else:
+            self._max_requests_per_visitor = max(1, int(value))
         self.changed.emit()
+
+    @Property(bool, notify=changed)
+    def maxRequestsPerVisitorLocked(self):
+        """Whether the field is pinned because the target is a static page."""
+        return not self._include_subdomains
+
+    @Property(str, notify=changed)
+    def maxRequestsPerVisitorHint(self):
+        """What the per-visitor setting currently means, in one line."""
+        if not self._include_subdomains:
+            return (
+                "Static page: pinned to 1. Each visitor loads the target once, "
+                "then leaves."
+            )
+        return (
+            f"Each visitor makes a random 1-{self._max_requests_per_visitor} page "
+            f"visits, drawn uniformly."
+        )
+
+    @Property("QVariantMap", notify=changed)
+    def safetyCeiling(self):
+        """
+        The derived global request ceiling, for display in place of the old field.
+
+        The operator can no longer set this number, so they have to be able to see
+        it -- otherwise a run stopping at a ceiling they never chose reads as a
+        bug. Empty when the target does not yet yield a scope.
+        """
+        if not self._derives_a_host():
+            return {}
+        try:
+            config = self._build_config_for_preview()
+        except Exception:
+            return {}
+        if config is None:
+            return {}
+        return config.ceiling_breakdown()
+
+    @Property(str, notify=changed)
+    def safetyCeilingSummary(self):
+        parts = self.safetyCeiling
+        if not parts:
+            return ""
+        return (
+            f"{parts['total']} requests: {parts['pages']} page "
+            f"({parts['visitors']} visitors x {parts['requests_per_visitor']} "
+            f"max), {parts['funnel_requests']} funnel, {parts['headroom']} headroom"
+        )
 
     @Property(bool, notify=changed)
     def headless(self):
@@ -934,136 +1057,10 @@ class AuditBackend(QObject):
             self.changed.emit()
             return
 
-        hosts = [h.strip() for h in self._scope_hosts.replace(",", " ").split() if h.strip()]
-        excluded = [h.strip() for h in self._exclude_hosts.replace(",", " ").split() if h.strip()]
-        if self._enable_funnel:
-            # The rate is only fatal when the funnel is on: with it off the field
-            # decides no traffic, so refusing to start would block a run that is
-            # perfectly well-defined. Same rule the engine applies in `__post_init__`.
-            try:
-                rate = parse_rate_pct(self._campaign_rate)
-            except ValueError:
-                self._error = (
-                    f"Campaign interaction rate {self._campaign_rate!r} is not a "
-                    f"number; give a percentage like 2.5."
-                )
-                self.changed.emit()
-                return
-            if rate <= 0:
-                self._error = (
-                    "Campaign interaction rate is 0, so no visitor would click a "
-                    "banner and the funnel would measure nothing."
-                )
-                self.changed.emit()
-                return
         try:
-            scope = TargetScope.from_urls(
-                hosts,
-                allow_subdomains=self._allow_subdomains,
-                acknowledged=True,
-                exclude_urls=excluded,
-            )
-        except Exception as exc:
-            self._error = f"Invalid scope: {exc}"
-            self.changed.emit()
-            return
-
-        proxy: Optional[Any] = None
-        if self._proxy_mode_index == 1:
-            if not self._proxy_file:
-                self._error = "Select a proxy list file, or choose 'No proxy'."
-                self.changed.emit()
-                return
-            proxy = {
-                "mode": "file",
-                "file": self._proxy_file,
-                "policy": ["round_robin", "least_used", "random"][self._proxy_policy_index],
-            }
-        elif self._proxy_mode_index == 2:
-            if not self._proxy_gateway:
-                self._error = "Enter a gateway URL, or choose 'No proxy'."
-                self.changed.emit()
-                return
-            proxy = {"mode": "gateway", "gateway": self._proxy_gateway}
-
-        seed: Optional[int] = None
-        if self._seed:
-            try:
-                seed = int(self._seed)
-            except ValueError:
-                self._error = "Seed must be a whole number, or empty."
-                self.changed.emit()
-                return
-
-        # Both are parsed here rather than in QML so a typo is rejected with a
-        # reason instead of reaching the engine as a silently empty mapping. An
-        # audit that drops its own Authorization header still reports a verdict,
-        # and that verdict is about the login page.
-        try:
-            extra_headers = _parse_header_lines(self._extra_headers)
+            config = self._build_config()
         except ValueError as exc:
-            self._error = f"Custom headers: {exc}"
-            self.changed.emit()
-            return
-
-        paths = _parse_path_lines(self._paths)
-        for path in paths:
-            if not path.startswith("/") or "://" in path:
-                self._error = (
-                    f"Extra path {path!r} must be a path on the target "
-                    f"(e.g. /pricing), not a full URL: the audit stays on the "
-                    f"audited host."
-                )
-                self.changed.emit()
-                return
-
-        artifact_dir = self._artifact_dir.strip()
-        if artifact_dir:
-            try:
-                Path(artifact_dir).mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                self._error = f"Artifact directory unusable: {exc}"
-                self.changed.emit()
-                return
-
-        journey = replace(
-            JourneyConfig(), max_requests_per_visitor=self._max_requests_per_visitor
-        )
-
-        config = AuditConfig(
-            target_url=self._target,
-            scope=scope,
-            max_evasion_level=self._max_level,
-            single_level_mode=self._single_level_mode,
-            single_level=self._single_level,
-            enable_outbound_funnel=self._enable_funnel,
-            outbound_campaign_rate_pct=self._campaign_rate,
-            include_iframes=self._include_iframes,
-            visitor_count=self._visitors,
-            duration_hours=self._hours,
-            pattern=ArrivalPattern.ALL[self._pattern_index],
-            proxy=proxy,
-            seed=seed,
-            headless=True if self._force_headless else None,
-            paths=paths,
-            extra_headers=extra_headers,
-            cooldown_between_levels_s=self._cooldown_s,
-            artifact_dir=artifact_dir or None,
-            reuse_browser=self._reuse_browser,
-            journey=journey,
-            limits=SafetyLimits(
-                max_requests=self._max_requests,
-                max_rps=self._max_rps,
-                max_concurrency=self._max_concurrency,
-                max_arrivals_per_minute=self._max_per_minute,
-                max_per_proxy=self._max_per_proxy,
-                abort_after_consecutive_errors=self._abort_after_errors,
-            ),
-        )
-
-        problems = config.validate()
-        if problems:
-            self._error = "; ".join(problems)
+            self._error = str(exc)
             self.changed.emit()
             return
 
@@ -1078,10 +1075,24 @@ class AuditBackend(QObject):
                 f"Starting audit of {self._target} - {self._visitors} visitors over "
                 f"{self._hours:g}h, levels 0-{self._max_level}"
             )
-        self._append_log(
-            f"Ceilings: {self._max_requests} requests, {self._max_rps}/s, "
-            f"{self._max_concurrency} concurrent, {self._max_per_minute}/min"
-        )
+        limits = config.resolved_limits()
+        if config.auto_scale_ceiling:
+            # The operator never set this number, so the log has to show where it
+            # came from or a run stopping at it reads as a bug.
+            parts = config.ceiling_breakdown()
+            self._append_log(
+                f"Ceilings: {limits.max_requests} requests = "
+                f"{parts['pages']} page + {parts['funnel_requests']} funnel + "
+                f"{parts['headroom']} headroom (derived), "
+                f"{limits.max_rps}/s, {limits.max_concurrency} concurrent, "
+                f"{limits.max_arrivals_per_minute}/min"
+            )
+        else:
+            self._append_log(
+                f"Ceilings: {limits.max_requests} requests, {limits.max_rps}/s, "
+                f"{limits.max_concurrency} concurrent, "
+                f"{limits.max_arrivals_per_minute}/min"
+            )
 
         self._running = True
         self.runningChanged.emit()
@@ -1090,6 +1101,156 @@ class AuditBackend(QObject):
         self._worker.finished_report.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
+
+    def _build_config(self, *, create_dirs: bool = True) -> AuditConfig:
+        """
+        Assemble the run's config, or raise ValueError with a reason to show.
+
+        Shared by `start()` and the ceiling preview so the number the operator is
+        shown is the number the run will actually enforce. Building it twice from
+        the same fields is fine; building it two *different* ways was the bug this
+        avoids.
+
+        `create_dirs` is off for the preview: the artifact directory is made as a
+        side effect of validating it, and a property read bound to a text field
+        must not touch the filesystem on every keystroke.
+        """
+        excluded = [
+            h.strip() for h in self._exclude_hosts.replace(",", " ").split() if h.strip()
+        ]
+        if self._enable_funnel:
+            # The rate is only fatal when the funnel is on: with it off the field
+            # decides no traffic, so refusing to start would block a run that is
+            # perfectly well-defined. Same rule the engine applies in `__post_init__`.
+            try:
+                rate = parse_rate_pct(self._campaign_rate)
+            except ValueError:
+                raise ValueError(
+                    f"Campaign interaction rate {self._campaign_rate!r} is not a "
+                    f"number; give a percentage like 2.5."
+                ) from None
+            if rate <= 0:
+                raise ValueError(
+                    "Campaign interaction rate is 0, so no visitor would click a "
+                    "banner and the funnel would measure nothing."
+                )
+        try:
+            # The scope is derived from the target, so there is no second field to
+            # disagree with it. `for_target` keeps the target's own host in scope
+            # even when it sits on a subdomain.
+            scope = TargetScope.for_target(
+                self._target,
+                include_subdomains=self._include_subdomains,
+                acknowledged=True,
+                acknowledgment_note=AUTO_ACKNOWLEDGMENT_NOTE,
+                exclude_urls=excluded,
+            )
+        except Exception as exc:
+            raise ValueError(f"Invalid scope: {exc}") from None
+
+        proxy: Optional[Any] = None
+        if self._proxy_mode_index == 1:
+            if not self._proxy_file:
+                raise ValueError("Select a proxy list file, or choose 'No proxy'.")
+            proxy = {
+                "mode": "file",
+                "file": self._proxy_file,
+                "policy": ["round_robin", "least_used", "random"][self._proxy_policy_index],
+            }
+        elif self._proxy_mode_index == 2:
+            if not self._proxy_gateway:
+                raise ValueError("Enter a gateway URL, or choose 'No proxy'.")
+            proxy = {"mode": "gateway", "gateway": self._proxy_gateway}
+
+        seed: Optional[int] = None
+        if self._seed:
+            try:
+                seed = int(self._seed)
+            except ValueError:
+                raise ValueError("Seed must be a whole number, or empty.") from None
+
+        # Both are parsed here rather than in QML so a typo is rejected with a
+        # reason instead of reaching the engine as a silently empty mapping. An
+        # audit that drops its own Authorization header still reports a verdict,
+        # and that verdict is about the login page.
+        try:
+            extra_headers = _parse_header_lines(self._extra_headers)
+        except ValueError as exc:
+            raise ValueError(f"Custom headers: {exc}") from None
+
+        paths = _parse_path_lines(self._paths)
+        for path in paths:
+            if not path.startswith("/") or "://" in path:
+                raise ValueError(
+                    f"Extra path {path!r} must be a path on the target "
+                    f"(e.g. /pricing), not a full URL: the audit stays on the "
+                    f"audited host."
+                )
+
+        artifact_dir = self._artifact_dir.strip()
+        if artifact_dir and create_dirs:
+            try:
+                Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(f"Artifact directory unusable: {exc}") from None
+
+        # A static page makes one hop per visitor, so the draw's top is 1 and the
+        # runner's per-visitor cap agrees with it. Otherwise N is the top of a
+        # uniform 1..N draw, and the cap is the same N so the plan can never
+        # promise more pages than the runner will allow.
+        per_visitor = (
+            self._max_requests_per_visitor if self._include_subdomains else 1
+        )
+        journey = replace(
+            JourneyConfig(),
+            max_requests_per_visitor=per_visitor,
+            uniform_pages_max=per_visitor,
+        )
+
+        config = AuditConfig(
+            target_url=self._target,
+            scope=scope,
+            max_evasion_level=self._max_level,
+            single_level_mode=self._single_level_mode,
+            single_level=self._single_level,
+            enable_outbound_funnel=self._enable_funnel,
+            outbound_campaign_rate_pct=self._campaign_rate,
+            include_iframes=self._include_iframes,
+            # The global ceiling is derived from the plan rather than typed, so it
+            # cannot disagree with the traffic the run intends to send.
+            auto_scale_ceiling=True,
+            visitor_count=self._visitors,
+            duration_hours=self._hours,
+            pattern=ArrivalPattern.ALL[self._pattern_index],
+            proxy=proxy,
+            seed=seed,
+            headless=True if self._force_headless else None,
+            paths=paths,
+            extra_headers=extra_headers,
+            cooldown_between_levels_s=self._cooldown_s,
+            artifact_dir=artifact_dir or None,
+            reuse_browser=self._reuse_browser,
+            journey=journey,
+            limits=SafetyLimits(
+                max_rps=self._max_rps,
+                max_concurrency=self._max_concurrency,
+                max_arrivals_per_minute=self._max_per_minute,
+                max_per_proxy=self._max_per_proxy,
+                abort_after_consecutive_errors=self._abort_after_errors,
+            ),
+        )
+
+        problems = config.validate()
+        if problems:
+            raise ValueError("; ".join(problems))
+        return config
+
+    def _build_config_for_preview(self) -> Optional[AuditConfig]:
+        """`_build_config` for a half-filled form, or None when it cannot build."""
+        try:
+            return self._build_config(create_dirs=False)
+        except Exception:
+            return None
 
     @Slot()
     def stop(self) -> None:
@@ -1226,7 +1387,7 @@ class AuditBackend(QObject):
             header = (
                 f"WAF / bot-defense audit\n"
                 f"Target: {self._target}\n"
-                f"Scope: {self._scope_hosts}\n"
+                f"Scope: {self.scopeDescription}\n"
                 f"Visitors: {self._visitors} over {self._hours:g}h\n\n"
             )
             Path(path).write_text(header + body + "\n", encoding="utf-8")

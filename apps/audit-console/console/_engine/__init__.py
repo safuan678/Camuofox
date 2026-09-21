@@ -75,7 +75,12 @@ from .journey import (
 )
 from .runner import AuditRunner, SafetyStop, run_audit
 from .schedule import Arrival, ArrivalPattern, Schedule, ScheduleConfig, build_schedule
-from .scope import AuthorizationRequired, ScopeViolation, TargetScope
+from .scope import (
+    AuthorizationRequired,
+    ScopeViolation,
+    TargetScope,
+    registrable_domain,
+)
 
 __all__ = [
     # config
@@ -91,6 +96,7 @@ __all__ = [
     "Cursor",
     # scope
     "TargetScope",
+    "registrable_domain",
     "ScopeViolation",
     "AuthorizationRequired",
     # detection
