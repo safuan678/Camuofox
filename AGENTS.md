@@ -206,8 +206,14 @@ responsive and Stop always works.
 
 The QML is split by page: `qml/main.qml` holds the shell (tab bar, sidebar,
 status bar) plus the Browsers/GeoIP/Info pages, and `qml/tabs/` holds one file per
-audit page — `AuditTab.qml` (configuration + live run), `LogsTab.qml` (run log),
-`ReportsTab.qml` (findings, per-level table, funnel, report files). The tab bar in
+audit page — `AuditTab.qml` (configuration, live run, findings, and the
+copy/export actions) and `LogsTab.qml` (run log). There is deliberately no
+Reports page: findings, the per-level table and the funnel are all on the Audit
+page, and the engine's own JSON/CSV/HTML/text files (`report.py`, unchanged) are
+where a finished run is read from. A new QML page was tried and dropped, so do
+not reintroduce one without a reason the Audit page cannot serve.
+
+The tab bar in
 `main.qml` owns the index (`id: tabBar`, `property int active`) and the
 `StackLayout` binds to it; callers switch pages with `root.openTab(i)` rather than
 assigning `currentIndex`, so the highlight and the visible page cannot drift apart.
@@ -230,21 +236,28 @@ rolls a per-visitor CTR, follows the chosen banner to its destination,
 and measures landing-page engagement. It is **observation only** — it records
 what the audited site served and where it pointed, and never drives a conversion.
 
-- **A URL found in the DOM is not an authorized host.** This is the load-bearing
-  rule. The feature's own spec asked for "dynamic scope management" from
-  DOM-extracted URLs, and the tempting implementation — let the page widen the
-  scope — would hand the *target* control over what this tool may touch (a link
-  can be injected, and an audit that follows any of them is an open request
-  forwarder). So discovery is dynamic, authorization is not: the operator names
-  partner hosts up front in `TargetScope.outbound_hosts` (the
-  `outbound_urls=` argument to `from_urls`, the "Partner campaign hosts" GUI
-  field), and `check_unattended()` admits exactly those. An undeclared banner is
-  **seen and reported as a refusal**, never followed.
-- **The outbound gate refuses more than an unknown host.** `authorize_outbound()`
-  rejects non-http(s) schemes, IP-literal hosts (the cloud metadata endpoint is a
-  literal, and so is any internal service a campaign link could be tricked into
-  naming), and a host that merely ends with a declared partner's name
-  (`evil-partner.example.net` must not match `partner.example.net`).
+- **The campaign gate is deny-by-exception, and the two gate questions are kept
+  apart.** The funnel exists to measure the ad traffic a page actually serves, so
+  every banner the page (or an iframe in it) serves is followed by default; an
+  audit that skipped a site's real campaign traffic would report "no banner" for a
+  page that was displaying one. The operator's exclusion list is the only thing
+  that stops one: `TargetScope.excluded_outbound_hosts` (the `exclude_urls=`
+  argument to `from_urls`, the "Exclude campaign hosts" GUI field). An excluded
+  banner is **seen and reported as a refusal**, never followed.
+  Two questions, deliberately not merged:
+  - `authorize_outbound()` — the *funnel* question. Asked once, when the walk
+    decides to click a banner.
+  - `permits_navigation()` — the *navigation* question. Asked by the browser guard
+    and the redirect handler; admits the target plus hosts the funnel already
+    reached (`session_outbound`). It must **not** call `authorize_outbound`: with
+    the funnel's default now "follow", that would permit every URL and dissolve
+    the guard.
+- **The outbound gate refuses more than an unfollowed host.** `authorize_outbound()`
+  still rejects non-http(s) schemes, an empty host, and IP-literal hosts (the cloud
+  metadata endpoint is a literal, and so is any internal service a campaign link
+  could be tricked into naming). An exclusion matches on a label boundary, so
+  `ads.example.net` also skips `track.ads.example.net` but never
+  `notads.example.net`.
 - **The funnel only runs on a behavior rung.** `_funnel_applies()` gates it to
   L5+, because a click-through is an interaction, and emitting one on a rung that
   does not claim behavior would make that rung's verdict the product of an

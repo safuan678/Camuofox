@@ -5,11 +5,21 @@ import "../theme"
 import "../components"
 
 //: Audit tab: configuration on the left, the live run and its results on the
-//: right. The run log and the finished report each have their own tab, so this
-//: page stays about running an audit -- its live progress and findings -- rather
-//: than about reading a finished one.
+//: right. The run log has its own tab, so this page stays about running an audit
+//: -- its live progress and findings -- rather than about reading a finished one.
 Item {
     id: auditTab
+
+    //: Result of the last "Export summary", shown until the next one.
+    property string exportMessage: ""
+
+    //: Holds the findings as text so "Copy findings" has something to select.
+    //: Never shown; a TextEdit is the only thing that can reach the clipboard.
+    TextEdit {
+        id: findingsClip
+        visible: false
+        text: auditBackend.findings.join("\n")
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -139,7 +149,7 @@ Item {
                         }
                         Header {
                             Layout.leftMargin: Theme.s3
-                            text: "PARTNER CAMPAIGN HOSTS"
+                            text: "EXCLUDE CAMPAIGN HOSTS"
                             visible: auditBackend.enableOutboundFunnel
                         }
                         Input {
@@ -147,9 +157,9 @@ Item {
                             Layout.rightMargin: Theme.s3
                             Layout.fillWidth: true
                             visible: auditBackend.enableOutboundFunnel
-                            placeholder: "partner.example.net (optional)"
-                            Component.onCompleted: text = auditBackend.outboundHosts
-                            onTextChanged: auditBackend.setOutboundHosts(text)
+                            placeholder: "ads.example.net (optional)"
+                            Component.onCompleted: text = auditBackend.excludeHosts
+                            onTextChanged: auditBackend.setExcludeHosts(text)
                         }
                         Header {
                             Layout.leftMargin: Theme.s3
@@ -955,10 +965,9 @@ Item {
                     }
                 }
 
-                    // The run log and the finished report each have their own tab: a
-                    // full-height console and a full-width document both read far better
-                    // than the strips that used to sit here. This footer is the signpost,
-                    // so neither becomes a page nobody finds.
+                    // The run log has its own tab: a full-height console reads far
+                    // better than the strip that used to sit here. This footer is
+                    // the signpost, so it does not become a page nobody finds.
                     Rectangle {
                         Layout.fillWidth: true
                         height: Theme.row
@@ -975,20 +984,31 @@ Item {
                                 Layout.fillWidth: true
                                 elide: Text.ElideRight
                                 text: auditBackend.log.length
-                                      ? auditBackend.log.length + " log line(s); output and the report are in their own tabs."
-                                      : "Run output and the finished report each have their own tab."
+                                      ? auditBackend.log.length + " log line(s); run output is in its own tab."
+                                      : "Run output has its own tab."
+                            }
+                            Btn {
+                                text: "Copy findings"
+                                on: auditBackend.findings.length > 0
+                                onClicked: {
+                                    findingsClip.selectAll()
+                                    findingsClip.copy()
+                                }
+                            }
+                            Btn {
+                                text: "Export summary"
+                                icon: "\uE74E"
+                                on: auditBackend.summary.visits !== undefined
+                                onClicked: {
+                                    const r = auditBackend.browseExportText()
+                                    auditTab.exportMessage = r.message || ""
+                                }
                             }
                             Btn {
                                 text: "Logs"
                                 icon: "\uE756"
-                                onClicked: root.openTab(4)
-                            }
-                            Btn {
-                                text: "Reports"
-                                icon: "\uE8A5"
                                 accent: Theme.accent
-                                on: auditBackend.summary.visits !== undefined
-                                onClicked: root.openTab(5)
+                                onClicked: root.openTab(4)
                             }
                         }
                     }

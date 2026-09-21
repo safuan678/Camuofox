@@ -219,14 +219,14 @@ def _funnel_findings(report: AuditReport) -> List[str]:
     if funnel["clicks"] == 0:
         lines.append(
             "Outbound funnel auditing ran but no visitor clicked a promotional "
-            "banner. Either no authorized banner was present on the audited page, "
-            "or the interaction rate was too low for the sample size."
+            "banner. Either no banner was present on the audited page, or the "
+            "interaction rate was too low for the sample size."
         )
-        if not report.config.scope.outbound_hosts:
+        if report.config.scope.excluded_outbound_hosts:
             lines.append(
-                "No partner destinations were declared in the scope, so partner "
-                "banners were refused before being followed. Declare campaign hosts "
-                "to follow them."
+                "Campaign hosts were excluded from this run ("
+                + ", ".join(sorted(report.config.scope.excluded_outbound_hosts))
+                + "), so banners on those hosts were skipped rather than followed."
             )
         return lines
 
@@ -241,8 +241,7 @@ def _funnel_findings(report: AuditReport) -> List[str]:
     if funnel["partner_clicks"]:
         lines.append(
             f"{funnel['first_party_clicks']} click-through(s) stayed on the audited "
-            f"site and {funnel['partner_clicks']} left for a declared partner "
-            f"destination."
+            f"site and {funnel['partner_clicks']} left for a campaign destination."
         )
 
     dwell_p50 = funnel["dwell_p50_s"]
@@ -284,11 +283,11 @@ def _funnel_findings(report: AuditReport) -> List[str]:
             + "."
         )
 
-    if not report.config.scope.outbound_hosts:
+    if report.config.scope.excluded_outbound_hosts:
         lines.append(
-            "Only first-party (in-scope) banners were followable, because no partner "
-            "destinations were declared; partner banners were refused and are not "
-            "counted above."
+            "Banners on the excluded campaign hosts ("
+            + ", ".join(sorted(report.config.scope.excluded_outbound_hosts))
+            + ") were skipped and are not counted above."
         )
 
     return lines
@@ -363,8 +362,8 @@ def render_text(report: AuditReport) -> str:
         funnel = report.funnel_summary()
         add(f"  interaction rate : {funnel['rate_pct']:g}%")
         add(f"  scan scope       : {'main document + iframes' if report.config.include_iframes else 'main document only'}")
-        add(f"  declared partners: {', '.join(report.config.scope.outbound_hosts) or '(none)'}")
-        add(f"  admitted  this run: {', '.join(sorted(report.config.scope.session_outbound)) or '(none)'}")
+        add(f"  excluded hosts   : {', '.join(report.config.scope.excluded_outbound_hosts) or '(none)'}")
+        add(f"  reached this run : {', '.join(sorted(report.config.scope.session_outbound)) or '(none)'}")
         add(f"  clicks           : {funnel['clicks']} (first-party {funnel['first_party_clicks']}, "
             f"partner {funnel['partner_clicks']})")
         add(f"  landed           : {funnel['landed']} ({funnel['landing_rate']:.0%} of clicks)")
@@ -525,8 +524,8 @@ def render_html(report: AuditReport) -> str:
 <h2>Outbound funnel &amp; campaign CTR</h2>
 <div class="card"><dl class="kv">
  <dt>Interaction rate</dt><dd>{funnel['rate_pct']:g}%</dd>
- <dt>Declared partners</dt><dd>{esc(', '.join(report.config.scope.outbound_hosts) or '(none)')}</dd>
- <dt>Admitted this run</dt><dd>{esc(', '.join(sorted(report.config.scope.session_outbound)) or '(none)')}</dd>
+ <dt>Excluded campaign hosts</dt><dd>{esc(', '.join(report.config.scope.excluded_outbound_hosts) or '(none)')}</dd>
+ <dt>Reached this run</dt><dd>{esc(', '.join(sorted(report.config.scope.session_outbound)) or '(none)')}</dd>
  <dt>Banner clicks</dt><dd>{funnel['clicks']} (first-party {funnel['first_party_clicks']}, partner {funnel['partner_clicks']})</dd>
  <dt>Landed</dt><dd>{funnel['landed']} ({funnel['landing_rate']:.0%} of clicks)</dd>
  <dt>Landing dwell</dt><dd>{dwell}</dd>

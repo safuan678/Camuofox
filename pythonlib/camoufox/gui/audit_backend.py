@@ -19,9 +19,10 @@ import json
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
     Property,
@@ -47,11 +48,22 @@ from ..audit.detection import Verdict as _Verdict
 from ..audit.report import build_findings, render_text, write_report
 from ..audit.schedule import ArrivalPattern
 
-__all__ = ["AuditVisitModel", "AuditBackend"]
+__all__ = ["AuditVisitModel", "AuditBackend", "RollingLogBuffer"]
 
 #: RFC 9110 token, which is what a header field name must be. Used to reject a
 #: typo like "Authorization :" before it becomes a mystery 401.
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+#: The log is a FIFO with two independent ceilings: an age window and a line
+#: count. Whichever is reached first evicts from the head.
+#:
+#: Two ceilings because they fail differently. An audit that stalls still emits
+#: lines, so the count cap bounds a long run; an audit that idles bursts after a
+#: pause, so the age window keeps a stale line from sitting at the top forever.
+#: A live audit logs thousands of lines, and holding all of them for the length of
+#: a run is what made the window grow without bound.
+_LOG_WINDOW_S = 2 * 60 * 60
+_LOG_MAX_LINES = 5000
 
 
 _VERDICT_COLOR = {
@@ -87,6 +99,53 @@ def _parse_header_lines(raw: str) -> Dict[str, str]:
             raise ValueError(f"header line {number} has an invalid name ({name!r})")
         headers[name] = value.strip()
     return headers
+
+
+class RollingLogBuffer:
+    """
+    A bounded FIFO of timestamped log lines.
+
+    Evicts from the head whenever either ceiling is crossed: the buffer holds at
+    most `max_lines` entries and drops any entry older than `window_s`. Both are
+    enforced on every append, so the buffer's size is bounded by construction
+    rather than by a periodic sweep that a busy run could outrun.
+
+    Timestamps are stored alongside each line rather than parsed back out of the
+    formatted text, because the formatted line also carries a clock time for the
+    operator and the two must not be allowed to disagree.
+    """
+
+    def __init__(self, max_lines: int = _LOG_MAX_LINES, window_s: float = _LOG_WINDOW_S):
+        self._max_lines = max(1, int(max_lines))
+        self._window_s = max(0.0, float(window_s))
+        self._entries: Deque[Tuple[float, str]] = deque()
+
+    def append(self, line: str, *, now: Optional[float] = None) -> None:
+        """Add `line`, evicting from the head until both ceilings hold again."""
+        moment = time.monotonic() if now is None else now
+        self._entries.append((moment, f"[{time.strftime('%H:%M:%S')}] {line}"))
+        self._trim(moment)
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self._window_s
+        # Drop by age first, then by count. An entry exactly at the cutoff is kept:
+        # the window is "older than", not "at least as old as".
+        while self._entries and self._entries[0][0] < cutoff:
+            self._entries.popleft()
+        while len(self._entries) > self._max_lines:
+            self._entries.popleft()
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def lines(self, limit: Optional[int] = None) -> List[str]:
+        """The buffered lines, oldest first, optionally only the newest `limit`."""
+        if limit is None or limit >= len(self._entries):
+            return [text for _, text in self._entries]
+        return [text for _, text in list(self._entries)[-limit:]]
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 def _parse_path_lines(raw: str) -> List[str]:
@@ -240,7 +299,7 @@ class AuditBackend(QObject):
         # --- target / scope ---------------------------------------------
         self._target = ""
         self._scope_hosts = ""
-        self._outbound_hosts = ""
+        self._exclude_hosts = ""
         self._allow_subdomains = False
         self._acknowledged = False
         self._ack_note = ""
@@ -295,7 +354,7 @@ class AuditBackend(QObject):
         self._proxy_policy_index = 0
 
         self._out_dir = ""
-        self._log: List[str] = []
+        self._log = RollingLogBuffer()
         self._findings: List[str] = []
         self._summary: Dict[str, Any] = {}
         self._preview: List[str] = []
@@ -310,7 +369,7 @@ class AuditBackend(QObject):
 
     @Property(list, notify=logChanged)
     def log(self):
-        return self._log[-300:]
+        return self._log.lines(limit=300)
 
     @Property(list, notify=findingsChanged)
     def findings(self):
@@ -391,13 +450,13 @@ class AuditBackend(QObject):
         self._refresh_preview()
 
     @Property(str, notify=changed)
-    def outboundHosts(self):
-        """Partner campaign hosts the operator authorizes for outbound follow-ups."""
-        return self._outbound_hosts
+    def excludeHosts(self):
+        """Campaign hosts whose banners the funnel must skip."""
+        return self._exclude_hosts
 
     @Slot(str)
-    def setOutboundHosts(self, value: str) -> None:
-        self._outbound_hosts = value or ""
+    def setExcludeHosts(self, value: str) -> None:
+        self._exclude_hosts = value or ""
         self.changed.emit()
         self._refresh_preview()
 
@@ -859,7 +918,7 @@ class AuditBackend(QObject):
         if self._running:
             return
         self._error = ""
-        self._log = []
+        self._log.clear()
         self._findings = []
         self._summary = {}
         self._visits.clear()
@@ -876,11 +935,11 @@ class AuditBackend(QObject):
             return
 
         hosts = [h.strip() for h in self._scope_hosts.replace(",", " ").split() if h.strip()]
-        outbound = [h.strip() for h in self._outbound_hosts.replace(",", " ").split() if h.strip()]
+        excluded = [h.strip() for h in self._exclude_hosts.replace(",", " ").split() if h.strip()]
         if self._enable_funnel:
-            # First-party-only funnels are legitimate (an on-site promotion), so
-            # this is not an error; but the operator should know that a partner
-            # banner will be refused before the run rather than after.
+            # The rate is only fatal when the funnel is on: with it off the field
+            # decides no traffic, so refusing to start would block a run that is
+            # perfectly well-defined. Same rule the engine applies in `__post_init__`.
             try:
                 rate = parse_rate_pct(self._campaign_rate)
             except ValueError:
@@ -902,7 +961,7 @@ class AuditBackend(QObject):
                 hosts,
                 allow_subdomains=self._allow_subdomains,
                 acknowledged=True,
-                outbound_urls=outbound,
+                exclude_urls=excluded,
             )
         except Exception as exc:
             self._error = f"Invalid scope: {exc}"
@@ -1040,7 +1099,7 @@ class AuditBackend(QObject):
 
     @Slot()
     def clearLog(self) -> None:
-        self._log = []
+        self._log.clear()
         self.logChanged.emit()
 
     @Slot()
@@ -1053,8 +1112,9 @@ class AuditBackend(QObject):
         self.summaryChanged.emit()
 
     def _append_log(self, line: str) -> None:
-        stamp = time.strftime("%H:%M:%S")
-        self._log.append(f"[{stamp}] {line}")
+        # The buffer stamps each line itself, so the two ceilings can evict on the
+        # same monotonic clock it records.
+        self._log.append(line)
         self.logChanged.emit()
 
     @Slot(dict)
