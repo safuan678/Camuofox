@@ -1808,12 +1808,14 @@ def test_parse_rate_pct_rejects_junk(bad):
         parse_rate_pct(bad)
 
 
-def test_scope_gate_refuses_undeclared_partner_even_though_discovery_found_it():
+def test_discovery_follows_a_third_party_banner_by_default():
     """
-    The safety invariant: a discovered host is not an authorized host.
+    The funnel is deny-by-exception: a discovered host is followable unless excluded.
 
-    This is the reconciliation of the "extend scope from DOM URLs" spec item --
-    the URL is *seen*, and reported, but not followed until declared.
+    This is the deliberate policy change from the allowlist design. A page's real
+    ad traffic is the thing being measured, so skipping it by default would report
+    "no banner" on a page that was showing one. The escape hatch is the exclusion
+    list, exercised in the next test.
     """
     scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
     candidates = discover_banner_candidates(
@@ -1830,22 +1832,48 @@ def test_scope_gate_refuses_undeclared_partner_even_though_discovery_found_it():
 
     assert first_party.first_party is True
     assert first_party.authorized is True
-    # Seen, retained for reporting, and deliberately not followable.
     assert third_party.first_party is False
+    assert third_party.authorized is True
+    assert not third_party.refusal
+
+
+def test_an_excluded_third_party_banner_is_seen_reported_and_not_followed():
+    """
+    The exclusion is the one thing that keeps a banner from being followed.
+
+    A refused banner is still discovered and retains a reason, so the report can
+    say which destination was skipped and why rather than silently dropping it.
+    """
+    scope = TargetScope.from_urls(
+        ["https://shop.example.com/"],
+        acknowledged=True,
+        exclude_urls=["https://untrusted.example.net/"],
+    )
+    candidates = discover_banner_candidates(
+        [
+            {"href": "https://shop.example.com/spring-sale", "selector": "a.promo-banner"},
+            {"href": "https://untrusted.example.net/offer", "selector": "a[data-campaign]"},
+        ],
+        page_url="https://shop.example.com/",
+        scope=scope,
+    )
+    by_host = {urlparse(c.url).hostname: c for c in candidates}
+    third_party = by_host["untrusted.example.net"]
+
     assert third_party.authorized is False
     assert third_party.refusal, "a refusal must carry a reason to report"
 
-    # The selection step must only ever consider authorized candidates.
+    # The selection step only ever considers authorized candidates, so with the
+    # third-party banner excluded the first-party one is what gets picked.
     picked = plan_outbound_visit("100", candidates, random.Random(0))
     assert picked.campaign_url is not None
     assert urlparse(picked.campaign_url).hostname == "shop.example.com"
 
 
-def test_a_declared_partner_becomes_followable_without_widening_the_scope():
+def test_a_partner_banner_is_followable_without_widening_the_scope():
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
     )
     candidates = discover_banner_candidates(
         [{"href": "https://partner.example.net/landing"}],
@@ -1855,7 +1883,8 @@ def test_a_declared_partner_becomes_followable_without_widening_the_scope():
     assert len(candidates) == 1
     assert candidates[0].authorized is True
     assert candidates[0].first_party is False
-    # Declaring a partner must not make the *target* scope broader.
+    # Following a partner must not make the *target* scope broader: the banner
+    # was admitted for this funnel hop, not added to the authorized hosts.
     assert scope.permits_url("https://partner.example.net/landing") is False
     assert scope.permits_url("https://shop.example.com/") is True
 
@@ -1876,31 +1905,35 @@ def test_ad_syndication_wrappers_are_filtered_and_lookalikes_are_not(url, expect
     assert is_ad_syndication_url(url) is expected
 
 
-def test_outbound_scope_round_trips_and_remembers_what_was_admitted():
+def test_outbound_scope_round_trips_and_remembers_what_was_reached():
     original = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
+        exclude_urls=["https://blocked.example.net/"],
     )
     assert original.check_unattended("https://partner.example.net/landing") is True
 
     restored = TargetScope.from_dict(original.to_dict())
-    assert restored.outbound_hosts == original.outbound_hosts
+    assert restored.excluded_outbound_hosts == original.excluded_outbound_hosts
     assert restored.session_outbound == original.session_outbound
     assert restored.check_unattended("https://partner.example.net/x") is True
-    # A host that was never declared is still refused after the round trip.
-    assert restored.check_unattended("https://other.example.net/x") is False
+    # The exclusion survives the round trip, so the blocked host stays blocked.
+    assert restored.check_unattended("https://blocked.example.net/x") is False
 
 
-def test_outbound_gate_refuses_ip_literals_and_lookalike_partner_hosts():
+def test_outbound_gate_refuses_ip_literals_and_excluded_hosts():
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
+        exclude_urls=["https://partner.example.net/"],
     )
-    # The metadata endpoint is a literal, and a lookalike must not match by suffix.
+    # The metadata endpoint is a literal and is never followed.
     assert scope.check_unattended("http://169.254.169.254/latest/meta-data") is False
-    assert scope.check_unattended("https://evil-partner.example.net/x") is False
+    # The named host is excluded, and so are its subdomains.
+    assert scope.check_unattended("https://partner.example.net/x") is False
+    assert scope.check_unattended("https://track.partner.example.net/x") is False
+    # A lookalike must not be caught by the exclusion.
+    assert scope.check_unattended("https://evil-partner.example.net/x") is True
     assert scope.check_unattended("javascript:alert(1)") is False
 
 
@@ -1908,7 +1941,6 @@ def test_an_unacknowledged_scope_permits_no_outbound_destination():
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=False,
-        outbound_urls=["https://partner.example.net/"],
     )
     assert scope.check_unattended("https://partner.example.net/x") is False
 
@@ -1988,13 +2020,13 @@ def test_include_iframes_false_excludes_child_frame_banners():
     assert [c.url for c in candidates] == ["https://shop.example.com/main-offer"]
 
 
-def test_iframe_banners_still_pass_the_outbound_gate():
+def test_iframe_banners_pass_the_gate_unless_their_host_is_excluded():
     """
-    A frame-derived destination is authorized exactly like a main-document one.
+    A frame-derived destination is treated exactly like a main-document one.
 
     A frame is untrusted content, so coming out of an iframe must not elevate a
-    destination. An undeclared partner host inside a frame is discovered (so it
-    can be reported) and left unauthorized (so it cannot be followed).
+    destination -- but it must not lower it either. An iframe banner is followable
+    by default, and is left unauthorized only when its host is excluded.
     """
     scope = TargetScope.from_urls(["https://shop.example.com/"], acknowledged=True)
     candidates = discover_banner_candidates(
@@ -2005,19 +2037,19 @@ def test_iframe_banners_still_pass_the_outbound_gate():
     )
     assert len(candidates) == 1
     assert candidates[0].from_iframe is True
-    assert candidates[0].authorized is False
-    assert candidates[0].refusal
+    assert candidates[0].authorized is True
+    assert not candidates[0].refusal
 
-    # And with no candidate authorized, the roll can never produce a destination.
-    assert plan_outbound_visit("100", candidates, random.Random(0)).triggered is False
+    # And the roll can produce a destination from the iframe banner.
+    assert plan_outbound_visit("100", candidates, random.Random(0)).triggered is True
 
 
-def test_a_declared_partner_inside_a_frame_is_authorized():
-    """The declaration, not the frame, is what admits an iframe destination."""
+def test_an_excluded_partner_inside_a_frame_is_refused():
+    """The exclusion, not the frame, is what refuses an iframe destination."""
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
+        exclude_urls=["https://partner.example.net/"],
     )
     candidates = discover_banner_candidates(
         [{"href": "https://partner.example.net/framed", "frame_index": 2}],
@@ -2025,7 +2057,10 @@ def test_a_declared_partner_inside_a_frame_is_authorized():
         scope=scope,
         include_iframes=True,
     )
-    assert candidates[0].authorized is True
+    assert candidates[0].authorized is False
+    assert candidates[0].refusal
+    # The frame ordinal is still carried, so a refusal can be reported with the
+    # frame it came from.
     assert candidates[0].frame_index == 2
 
 
@@ -2347,7 +2382,7 @@ def test_funnel_config_round_trips_through_to_dict():
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
+        exclude_urls=["https://partner.example.net/"],
     )
     cfg = AuditConfig(
         target_url="https://shop.example.com/",
@@ -2359,15 +2394,15 @@ def test_funnel_config_round_trips_through_to_dict():
     assert payload["enable_outbound_funnel"] is True
     # Normalized to a float by construction, so the serialized form is canonical.
     assert payload["outbound_campaign_rate_pct"] == pytest.approx(4.5)
-    assert payload["scope"]["outbound_hosts"] == ["partner.example.net"]
+    assert payload["scope"]["excluded_outbound_hosts"] == ["partner.example.net"]
 
 
-def _funnel_report(events, *, outbound_hosts=()):
+def _funnel_report(events, *, exclude_hosts=()):
     """Assemble an AuditReport carrying the given campaign events."""
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=list(outbound_hosts),
+        exclude_urls=list(exclude_hosts),
     )
     cfg = AuditConfig(
         target_url="https://shop.example.com/",
@@ -2422,7 +2457,7 @@ def test_funnel_summary_counts_clicks_landings_and_engagement():
                 refused_by_scope=True,
             ),
         ],
-        outbound_hosts=["partner.example.net"],
+        exclude_hosts=["partner.example.net"],
     )
     funnel = report.funnel_summary()
     assert funnel["clicks"] == 3
@@ -2454,7 +2489,7 @@ def test_a_landing_reason_mentioning_scope_is_not_tallied_as_a_refusal():
                 skipped_reason="navigation failed: the landing was outside its scope",
             )
         ],
-        outbound_hosts=["partner.example.net"],
+        exclude_hosts=["partner.example.net"],
     )
     funnel = report.funnel_summary()
     assert funnel["skipped_by_scope"] == 0
@@ -2479,7 +2514,7 @@ def test_funnel_findings_name_the_rate_and_the_engagement():
     assert "42" in joined
 
 
-def test_funnel_findings_warn_when_no_partner_hosts_are_declared():
+def test_funnel_findings_name_the_excluded_hosts():
     report = _funnel_report(
         [
             CampaignEvent(
@@ -2490,10 +2525,12 @@ def test_funnel_findings_warn_when_no_partner_hosts_are_declared():
                 landing_verdict="allowed",
                 dwell_s=20.0,
             )
-        ]
+        ],
+        exclude_hosts=["partner.example.net"],
     )
     joined = "\n".join(build_findings(report))
-    assert "no partner destinations were declared" in joined.lower()
+    assert "excluded" in joined.lower()
+    assert "partner.example.net" in joined
 
 
 def test_funnel_findings_say_so_when_nothing_clicked():
@@ -2655,12 +2692,12 @@ def test_the_funnel_is_off_by_default_so_no_rung_clicks():
     assert runner._funnel_applies(level_by_id(5)) is False
 
 
-def test_the_walk_selects_only_a_banner_the_scope_authorized():
+def test_the_walk_reports_an_excluded_banner_and_never_selects_it():
     """
-    The runner reports a refused banner and never selects it.
+    The runner reports an excluded banner and never selects it.
 
-    A stub page reports one authorized first-party banner and one undeclared
-    third-party banner, with the interaction rate pinned at 100% so the roll
+    A stub page reports one followable first-party banner and one banner on an
+    excluded campaign host, with the interaction rate pinned at 100% so the roll
     always fires. The walk is asserted to have chosen the first-party
     destination, and to have recorded the refused one -- and because the stub
     page cannot be clicked, the walk ends without a landing, which is the honest
@@ -2669,7 +2706,7 @@ def test_the_walk_selects_only_a_banner_the_scope_authorized():
     scope = TargetScope.from_urls(
         ["https://shop.example.com/"],
         acknowledged=True,
-        outbound_urls=["https://partner.example.net/"],
+        exclude_urls=["https://undeclared.example.net/"],
     )
     config = AuditConfig(
         target_url="https://shop.example.com/",
@@ -2708,7 +2745,7 @@ def test_the_walk_selects_only_a_banner_the_scope_authorized():
     evidence = " ".join(result.evidence)
 
     assert "undeclared.example.net" in evidence, "the refused banner must be reported"
-    assert result.campaign is not None, "the 100% roll must select an authorized banner"
+    assert result.campaign is not None, "the 100% roll must select a followable banner"
     assert urlparse(result.campaign.campaign_url).hostname == "shop.example.com"
     assert "undeclared.example.net" not in result.campaign.campaign_url
 
@@ -2796,12 +2833,13 @@ class _PartnerHandler(BaseHTTPRequestHandler):
 @pytest.fixture(scope="module")
 def redirect_waf_server():
     """
-    A target plus an undeclared partner host, both on localhost.
+    A target plus a non-excluded partner host, both on localhost.
 
     The scope is host-based, so two ports on `127.0.0.1` would both be in scope and
     the test could not tell a leak from a permitted request. The partner is
     therefore addressed as `localhost` while the target is `127.0.0.1`: distinct
-    hostnames, same loopback interface, so only the target is declared.
+    hostnames, same loopback interface, so a redirect aimed at the partner is
+    visibly a different host from the target.
     """
     partner = ThreadingHTTPServer(("127.0.0.1", 0), _PartnerHandler)
     threading.Thread(target=partner.serve_forever, daemon=True).start()

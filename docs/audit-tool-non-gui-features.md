@@ -34,18 +34,31 @@ rather than returning a flag. Because it raises, there is no code path that
 reaches a socket without passing it — a truthy-return API would let a caller
 forget the branch and still ship. Both the GUI and the CLI gate on it.
 
-The outbound half is stricter than the inbound one, because a URL found in the
-DOM is not an authorized host:
+The outbound half is deny-by-exception, because the funnel measures the ad
+traffic a page actually serves:
 
-- Partner hosts are named **up front** by the operator (`TargetScope.outbound_hosts`,
-  `outbound_urls=` to `from_urls`, the "Partner campaign hosts" GUI field).
-  Discovery is dynamic; authorization is not.
-- `authorize_outbound()` rejects non-`http(s)` schemes, IP-literal hosts (the
-  cloud metadata endpoint is a literal, and so is any internal service a
-  campaign link could be tricked into naming), and a host that merely *ends with*
-  a declared partner's name — `evil-partner.example.net` must not match
-  `partner.example.net`.
-- An undeclared banner is **seen and reported as a refusal**, never followed.
+- Every banner a page (or an iframe inside it) serves is **in scope by default**.
+  An audit that skipped a site's real campaign traffic would report "no banner"
+  for a page that was displaying one, which measures nothing.
+- The exception is the operator's exclusion list
+  (`TargetScope.excluded_outbound_hosts`, `exclude_urls=` to `from_urls`, the
+  "Exclude campaign hosts" GUI field). A host named there is skipped; naming
+  nothing excludes nothing. A bare name also covers its subdomains, so excluding
+  `ads.example.net` also skips `track.ads.example.net`.
+- `authorize_outbound()` still rejects non-`http(s)` schemes, an empty host, and
+  IP-literal hosts (the cloud metadata endpoint is a literal, and so is any
+  internal service a campaign link could be tricked into naming).
+- An excluded banner is **seen and reported as a refusal**, never followed.
+
+The gate has two distinct questions, and keeping them separate is what makes the
+above safe:
+
+- `authorize_outbound()` is the *funnel* question, asked once when the walk
+  decides to click a banner.
+- `permits_navigation()` is the *navigation* question, asked by the browser guard
+  and the redirect handler. It admits the target plus hosts the funnel already
+  reached. It deliberately does **not** call `authorize_outbound` — doing so
+  would permit every URL, because the funnel's default is now "follow".
 
 The egress containment added in PR #9 extends this to every hop: the guard is
 enforced on subresource requests and on redirects, not only on the top-level

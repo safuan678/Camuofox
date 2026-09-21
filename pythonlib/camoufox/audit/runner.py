@@ -313,10 +313,10 @@ class _ScopeGuard:
         Whether this URL may be requested.
 
         Two ways in, and both are operator-declared: the URL is inside the
-        authorized scope (which is what the target itself is), or it is one of the
-        operator's named outbound destinations. Nothing discovered at visit time
-        can widen this -- `_discover_banners` goes through the same gate, which is
-        why a hand-declared partner and a discovered banner are treated alike.
+        authorized scope (which is what the target itself is), or its host is one
+        the funnel already reached and recorded. Nothing discovered at visit time
+        can widen this -- the funnel admits a banner through `authorize_outbound`,
+        and only then does the guard let its landing page load.
 
         Note that `authorize_outbound` refuses IP-literal hosts outright (the
         cloud metadata endpoint is a literal), so an IP-literal target is admitted
@@ -358,11 +358,17 @@ def _scope_permits(scope: TargetScope, url: str) -> bool:
     """
     The scope gate in one place, so every path asks the same question.
 
-    In scope (the target) or an operator-declared outbound destination. Kept as a
-    function rather than a method because both the browser guard and the plain-HTTP
-    redirect handler need it, and a second copy is how the two would drift.
+    In scope (the target), or a host the funnel already admitted this session.
+    Kept as a function rather than a method because both the browser guard and the
+    plain-HTTP redirect handler need it, and a second copy is how the two would
+    drift.
+
+    Note this is the *navigation* question, not the funnel question. It deliberately
+    does not call `authorize_outbound`: doing so would make every URL permitted,
+    because the funnel's default is now to follow what the page serves. The funnel
+    asks `authorize_outbound` itself, at the moment it decides to click.
     """
-    return scope.permits_url(url) or scope.authorize_outbound(url)
+    return scope.permits_navigation(url)
 
 
 async def _capture_response(
@@ -1348,14 +1354,14 @@ class AuditRunner:
             return
         self._funnel_scope_noted = True
         scope = self.config.scope
-        if not scope.outbound_hosts:
+        if scope.excluded_outbound_hosts:
             self._progress(
                 event="notice",
                 message=(
-                    "Outbound funnel auditing is on but no partner destinations are "
-                    "declared, so only first-party (in-scope) banners will be "
-                    "followed. Declare campaign hosts in the scope's outbound list to "
-                    "follow partner links."
+                    "Outbound funnel auditing is on. Every banner the page serves is "
+                    "followed except those on the excluded campaign hosts: "
+                    + ", ".join(sorted(scope.excluded_outbound_hosts))
+                    + ". Remove a host from the exclusion list to follow it again."
                 ),
             )
 
@@ -1364,11 +1370,11 @@ class AuditRunner:
         Read the page's promotional banners and keep the ones we may follow.
 
         Discovery is dynamic -- the DOM decides which destinations exist, so there
-        is no hand-maintained campaign list to drift. Authorization is not: a
-        discovered host is followed only when the operator's scope already permits
-        it. A banner the gate refuses is dropped here and the refusal is recorded
-        by the caller, so a third-party or syndicated link shows up in the report
-        rather than being silently invisible.
+        is no hand-maintained campaign list to drift. The gate is what trims them:
+        a banner the page serves is followed by default, and one on a host the
+        operator excluded is dropped here, with the refusal recorded by the caller
+        so a skipped campaign link shows up in the report rather than being
+        silently invisible.
 
         With `include_iframes` on, every child frame is read as well. A campaign is
         routinely served from an ad iframe, so a main-frame-only scan reports "no
@@ -1502,16 +1508,17 @@ class AuditRunner:
         usable = [c for c in candidates if c.authorized]
         refused = [c for c in candidates if not c.authorized]
         if refused:
-            # A banner that exists but was not authorized is a finding in its own
-            # right: the page points somewhere the operator did not name. Recorded
-            # so it is visible, never followed.
+            # A banner that exists but was refused is a finding in its own right:
+            # the page points somewhere the operator excluded. Recorded so it is
+            # visible, never followed.
             result.evidence.append(
-                f"{len(refused)} banner(s) refused by scope, e.g. {refused[0].url!r}"
+                f"{len(refused)} banner(s) refused by the campaign gate, "
+                f"e.g. {refused[0].url!r}"
             )
         if not usable:
             result.evidence.append(
-                "no promotional banner was authorized to follow; "
-                "declare partner destinations in the outbound scope"
+                "every promotional banner on this page was on an excluded "
+                "campaign host; nothing was followed"
             )
             return False
 
@@ -1520,7 +1527,7 @@ class AuditRunner:
         )
         if not outbound.triggered or not outbound.campaign_url:
             result.evidence.append(
-                f"saw {len(usable)} authorized banner(s); CTR roll did not trigger"
+                f"saw {len(usable)} followable banner(s); CTR roll did not trigger"
             )
             return False
 
@@ -1536,10 +1543,14 @@ class AuditRunner:
         # Re-check right before the navigation. The gate is the only thing between
         # this and an unauthorized request, and re-reading it here means a banner
         # whose href changed between discovery and click cannot be followed.
-        if not _scope_permits(self.config.scope, destination):
-            event.skipped_reason = "outbound destination was not authorized by scope"
+        #
+        # This is the funnel's own decision, so it asks the funnel question
+        # (`authorize_outbound`), not the navigation one: a destination outside the
+        # target is followed by default now, unless the operator excluded it.
+        if not self.config.scope.authorize_outbound(destination):
+            event.skipped_reason = "outbound destination was refused by the campaign gate"
             event.refused_by_scope = True
-            result.evidence.append(f"refused out-of-scope campaign link {destination!r}")
+            result.evidence.append(f"refused excluded campaign link {destination!r}")
             return False
 
         return await self._visit_campaign_destination(

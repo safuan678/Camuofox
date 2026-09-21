@@ -162,9 +162,11 @@ class AuditConfig:
     #: exercised on the behavioral rungs (L5/L6) and skipped on the rest, which
     #: keeps a lower rung's verdict about the control it isolates.
     #:
-    #: Destinations are discovered from the page, but only *followed* when the
-    #: operator authorized them -- first-party links (already in scope) or a host
-    #: declared in `scope.outbound_hosts`. See `TargetScope.authorize_outbound`.
+    #: Destinations are discovered from the page and followed by default -- that
+    #: is the banner traffic the audit exists to measure. The exception is the
+    #: operator's exclusion list: a banner on a host in
+    #: `scope.excluded_outbound_hosts` is skipped. See
+    #: `TargetScope.authorize_outbound`.
     enable_outbound_funnel: bool = False
     #: Fraction of sessions that click a promotional banner, as a percentage.
     #:

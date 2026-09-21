@@ -213,7 +213,7 @@ ApplicationWindow {
                     //: Read from the pages themselves, so adding a tab cannot
                     //: leave this count behind.
                     readonly property int count: tabs.count
-                    readonly property var labels: ["Browsers", "GeoIP", "Info", "Audit", "Logs", "Reports"]
+                    readonly property var labels: ["Browsers", "GeoIP", "Info", "Audit", "Logs"]
 
                 Repeater {
                     model: tabBar.labels
@@ -1033,12 +1033,6 @@ ApplicationWindow {
 
                 // Logs
                 LogsTab {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                }
-
-                // Reports
-                ReportsTab {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                 }

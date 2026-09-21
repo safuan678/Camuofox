@@ -150,3 +150,87 @@ def test_setters_clamp_out_of_range_values(backend):
     assert backend.cooldownSeconds == 0.0
     backend.setMaxRequestsPerVisitor(0)
     assert backend.maxRequestsPerVisitor == 1
+
+# -- rolling log buffer -----------------------------------------------------
+#
+# The buffer is what keeps a long audit from growing the log window without
+# bound, so both ceilings are exercised directly rather than through a run.
+
+def _messages(buffer):
+    """The buffered lines with the display timestamp stripped off each one."""
+    return [line.split("] ", 1)[1] for line in buffer.lines()]
+
+
+def test_log_buffer_evicts_oldest_lines_past_the_count_ceiling():
+    buffer = ab.RollingLogBuffer(max_lines=5, window_s=10_000)
+    for index in range(12):
+        buffer.append(f"line {index}", now=100.0 + index * 0.001)
+
+    assert len(buffer) == 5
+    # The newest survive; the oldest are the ones dropped.
+    assert _messages(buffer) == [f"line {i}" for i in range(7, 12)]
+
+
+def test_log_buffer_evicts_lines_past_the_age_window():
+    buffer = ab.RollingLogBuffer(max_lines=1000, window_s=60.0)
+    for index in range(10):
+        buffer.append(f"old {index}", now=1000.0 + index)
+
+    # A long silence, then one new line: everything older than the window goes.
+    buffer.append("fresh", now=1100.0)
+
+    assert len(buffer) == 1
+    assert _messages(buffer) == ["fresh"]
+
+
+def test_log_buffer_keeps_a_line_at_exactly_the_window_edge():
+    """The window drops "older than", so an entry at the cutoff is retained."""
+    buffer = ab.RollingLogBuffer(max_lines=1000, window_s=60.0)
+    buffer.append("edge", now=1000.0)
+    buffer.append("now", now=1060.0)
+
+    assert _messages(buffer) == ["edge", "now"]
+
+
+def test_log_buffer_whichever_ceiling_comes_first_wins():
+    """A burst within the window still stops at the line cap."""
+    buffer = ab.RollingLogBuffer(max_lines=3, window_s=10_000.0)
+    for index in range(50):
+        buffer.append(f"burst {index}", now=500.0 + index * 0.01)
+
+    assert len(buffer) == 3
+    assert _messages(buffer) == ["burst 47", "burst 48", "burst 49"]
+
+
+def test_log_buffer_lines_limit_returns_only_the_newest():
+    buffer = ab.RollingLogBuffer(max_lines=100, window_s=10_000)
+    for index in range(20):
+        buffer.append(f"l{index}", now=200.0 + index * 0.01)
+
+    tail = buffer.lines(limit=3)
+    assert len(tail) == 3
+    assert [line.split("] ", 1)[1] for line in tail] == ["l17", "l18", "l19"]
+    # A limit wider than the buffer is not an error, and neither is clearing.
+    assert len(buffer.lines(limit=999)) == 20
+    buffer.clear()
+    assert len(buffer) == 0 and buffer.lines() == []
+
+
+def test_backend_log_property_is_bounded_even_after_many_lines(backend):
+    """
+    The bridge's own buffer must stay bounded, not just the standalone class.
+
+    A run emits far more lines than the window will ever show, so the ceiling
+    has to be enforced at the point lines are appended -- if it only trimmed on
+    read, the full history would still be held for the life of the run.
+    """
+    for index in range(ab._LOG_MAX_LINES + 250):
+        backend._append_log(f"line {index}")
+
+    assert len(backend._log) == ab._LOG_MAX_LINES
+    shown = backend.log
+    assert len(shown) == 300
+    assert shown[-1].endswith(f"line {ab._LOG_MAX_LINES + 249}")
+
+    backend.clearLog()
+    assert backend.log == []
