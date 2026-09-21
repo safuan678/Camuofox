@@ -236,17 +236,21 @@ Top-level commands: `fetch`, `set`, `sync`, `list`, `remove`, `test`, `server`,
 | `audit run` | Run an audit and emit reports |
 | `audit report` | Re-render a saved JSON report in another format |
 
-`audit run` is the full surface: `--target`, repeatable `--authorized-host`,
-`--allow-subdomains`, `--i-am-authorized` (**required**), `--visitors`, `--hours`,
-arrival distribution, `--max-level`, repeatable `--level`, single-rung mode,
-`--proxy-file` / `--proxy-gateway` / `--proxy-policy`, `--max-requests`,
-`--max-rps`, `--max-concurrency`, `--max-per-minute`, `--max-per-proxy`,
-headless/headful overrides, `--seed`, `--out`, `--quiet`.
+`audit run` is the full surface: `--target`, `--scope` (an extra host, repeatable),
+`--allow-subdomains` / `--no-subdomains`, `--i-am-authorized` (**required**),
+`--visitors`, `--hours`, arrival distribution, `--max-level`, repeatable `--level`,
+single-rung mode, `--proxy-file` / `--proxy-gateway` / `--proxy-policy`,
+`--max-requests`, `--max-rps`, `--max-concurrency`, `--max-per-minute`,
+`--max-per-proxy`, headless/headful overrides, `--seed`, `--out`, `--quiet`.
 
 Two properties worth calling out:
 
 - **`--i-am-authorized` is required, not a flag you may pass.** Authorization is
   an explicit act.
+- **The scope defaults to the target's main domain**, derived from `--target`.
+  A target of `https://staging.example.com/pricing` scopes to `example.com`, with
+  that subdomain kept in scope when subdomains are off. `--scope` exists only to
+  add hosts beyond the target's own site.
 - **`--seed` makes a run reproducible** for scheduling and behavior, so a
   surprising result can be re-run rather than argued about. Note it does *not*
   seed the target's own behavior — that is outside the tool's control.

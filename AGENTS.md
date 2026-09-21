@@ -303,6 +303,19 @@ Invariants worth not breaking:
 - **No traffic without an acknowledged scope.** `TargetScope.check()` is the only
   place that authorizes a request, and it raises rather than returning a flag.
   The GUI and CLI both gate on it; do not add a path that skips it.
+- **The scope is derived from the target, not typed.** `TargetScope.for_target()`
+  scopes to `registrable_domain(target)`, and keeps the target's own host in scope
+  even when subdomains are off — otherwise a target on a subdomain would be
+  refused its own arrival page. The derivation validates the host: `urlparse`
+  returns `not a url` for `//not a url`, so an unvalidated host would scope an
+  audit to a string that cannot resolve.
+- **Excluding subdomains pins the journey to one page.** "No subdomains" means
+  the target is a single static page, so the per-visitor cap is clamped to 1 in
+  the GUI bridge — in `setMaxRequestsPerVisitor` *and* again in `_build_config`,
+  so a later write cannot reopen it and the config carries the pinned value. A
+  disabled form field is not an enforcement; the clamp is. The clamp lives in the
+  bridge rather than in `AuditConfig` because the subdomain decision is a scope
+  property and `JourneyConfig` has no scope.
 - **`blocks` and `challenges` are different findings.** A Cloudflare
   "Attention Required!" page with a 403 is a *block*; the same marker with a 200
   is a *challenge*. Conflating them tells the operator to change the wrong

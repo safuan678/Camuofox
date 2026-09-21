@@ -852,9 +852,17 @@ def audit_levels() -> None:
     "--scope",
     "scope_hosts",
     multiple=True,
-    help="Authorized host (repeatable). Defaults to the target's host.",
+    help="Extra authorized host (repeatable). Defaults to the target's main "
+    "domain, derived from --target. Pass this only to add hosts beyond it.",
 )
-@click.option("--allow-subdomains", is_flag=True, help="Also authorize subdomains of the scoped hosts.")
+@click.option(
+    "--allow-subdomains/--no-subdomains",
+    "allow_subdomains",
+    default=True,
+    show_default=True,
+    help="Authorize subdomains of the scoped hosts. --no-subdomains treats the "
+    "target as a single static page.",
+)
 @click.option(
     "--i-am-authorized",
     "authorized",
@@ -937,11 +945,21 @@ def audit_run(
         )
         raise SystemExit(2)
 
-    scope = TargetScope.from_urls(
-        list(scope_hosts) or [target],
-        allow_subdomains=allow_subdomains,
-        acknowledged=True,
-    )
+    if scope_hosts:
+        # Explicit hosts widen the scope beyond the target's own site. The default
+        # is derived, so the CLI and the GUI agree on what "the audited scope"
+        # means; --scope exists for the rare run that legitimately spans hosts.
+        scope = TargetScope.from_urls(
+            list(scope_hosts),
+            allow_subdomains=allow_subdomains,
+            acknowledged=True,
+        )
+    else:
+        scope = TargetScope.for_target(
+            target,
+            include_subdomains=allow_subdomains,
+            acknowledged=True,
+        )
 
     proxy = None
     if proxy_gateway:

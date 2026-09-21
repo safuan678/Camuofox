@@ -130,6 +130,20 @@ class JourneyConfig:
     #: Pages viewed in one session.
     pages_min: int = 1
     pages_max: int = 6
+    #: When set, draw the page count uniformly from 1..this value instead of from
+    #: `pages_min`..`pages_max`.
+    #:
+    #: This is the GUI's "Max requests / visitor": the operator names a ceiling N
+    #: and each visitor lands somewhere in 1..N, so a run of 1000 visitors at N=5
+    #: produces a mix of 1-, 2-, 3-, 4- and 5-page sessions rather than the same
+    #: fixed journey repeated -- a population of identical session lengths is its
+    #: own signature. Distinct from `pages_max`, which is the top of the
+    #: human-journey range; this is the operator's stated ceiling, and the two
+    #: mean different things when a saved profile sets only one of them.
+    #:
+    #: Each draw is bounded by `max_requests_per_visitor`, so the ceiling the
+    #: operator set is also the largest journey that can be planned.
+    uniform_pages_max: Optional[int] = None
     #: Whether to scroll, and roughly how far down the page.
     scroll_probability: float = 0.85
     scroll_steps_min: int = 2
@@ -249,6 +263,46 @@ def plan_visit(
     sources = list(config.source_weights.keys())
     weights = list(config.source_weights.values())
     source = rng.choices(sources, weights=weights, k=1)[0]
+
+    # The operator's stated ceiling, when one was given. Every visitor draws its
+    # own session length uniformly from 1..N, so the population is a mix rather
+    # than one repeated journey. Bounded by the per-visitor request ceiling so the
+    # two cannot disagree: the plan must not promise more pages than the runner
+    # will let it make.
+    ceiling = int(config.uniform_pages_max or 0)
+    if ceiling > 0:
+        cap = int(config.max_requests_per_visitor)
+        ceiling = min(ceiling, cap) if cap > 0 else ceiling
+        pages = rng.randint(1, max(1, ceiling))
+        # A one-page draw *is* a bounce -- the visitor arrived, read, and left.
+        # Treated as one so the dwell shape stays right rather than reading a
+        # deliberate single-page session as an abandoned multi-page one.
+        is_bounce = pages <= 1
+        dwell = _lognormal(
+            config.dwell_median_s * (0.25 if is_bounce else 1.0),
+            config.dwell_sigma * (0.7 if is_bounce else 1.0),
+            config.dwell_min_s,
+            min(config.dwell_max_s, 60.0) if is_bounce else config.dwell_max_s,
+            rng,
+        )
+        scroll_steps = (
+            rng.randint(config.scroll_steps_min, config.scroll_steps_max)
+            if rng.random() < config.scroll_probability
+            else 0
+        )
+        page_dwell = _split_dwell(dwell, pages, rng)
+        return VisitPlan(
+            source=source,
+            referer=None,
+            dwell_s=dwell,
+            page_count=pages,
+            scroll_steps=scroll_steps,
+            will_type=rng.random() < config.type_probability,
+            is_bounce=is_bounce,
+            follow_links=rng.random() < config.follow_links_probability,
+            inter_page_delay_s=page_dwell[1:],
+            page_dwell_s=page_dwell,
+        )
 
     is_bounce = rng.random() < config.bounce_probability
     if is_bounce:

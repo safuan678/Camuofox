@@ -89,10 +89,14 @@ def test_paths_are_normalised_with_a_leading_slash():
 
 
 def _armed(backend):
-    """An acknowledged backend pointed at a target that parses cleanly."""
+    """A backend pointed at a target whose scope derives cleanly.
+
+    The scope is no longer typed -- it comes from the target -- so arming the
+    backend is just naming the target and a visitor count.
+    """
     backend.setAcknowledged(True)
     backend.setTarget("https://example.com/")
-    backend.setScopeHosts("example.com")
+    backend.setVisitors(6)
     return backend
 
 
@@ -234,3 +238,171 @@ def test_backend_log_property_is_bounded_even_after_many_lines(backend):
 
     backend.clearLog()
     assert backend.log == []
+
+
+# -- the scope is derived from the target, not typed -------------------------
+
+
+def test_the_authorized_host_is_derived_from_the_target(backend):
+    """
+    A page URL names the site; the site is the scope.
+
+    The old two-field form let the two disagree -- a target on a subdomain scoped
+    to the apex would have the audit refuse its own arrival page. Deriving removes
+    the possibility rather than documenting it.
+    """
+    backend.setTarget("https://staging.example.com/pricing")
+    assert backend.derivedHost == "example.com"
+    assert "example.com" in backend.scopeDescription
+
+
+def test_a_multi_label_country_code_keeps_its_registry_label(backend):
+    """`blog.example.co.uk` is one site, not two labels of `co.uk`."""
+    backend.setTarget("https://blog.example.co.uk/post")
+    assert backend.derivedHost == "example.co.uk"
+
+
+def test_an_ip_literal_derives_itself(backend):
+    """
+    A literal has no domain structure, so stripping labels would invent a scope.
+
+    `203.0.113.7` must stay whole; treating it as a three-label host would scope
+    the audit to `0.113.7`, which is not a host at all.
+    """
+    backend.setTarget("http://203.0.113.7:8080/app")
+    assert backend.derivedHost == "203.0.113.7"
+
+
+def test_an_empty_or_hostless_target_derives_nothing(backend):
+    for value in ("", "   ", "not a url"):
+        backend.setTarget(value)
+        assert backend.derivedHost == ""
+        assert not backend.canRun
+
+
+def test_subdomains_are_in_scope_by_default(backend):
+    backend.setTarget("https://example.com/")
+    assert backend.includeSubdomains is True
+    assert backend.subdomainsExcluded is False
+    assert "subdomain" in backend.scopeDescription
+
+
+def test_excluding_subdomains_is_the_inverse_toggle(backend):
+    """The two radio options are one setting, so each must move the other."""
+    backend.setSubdomainsExcluded(True)
+    assert backend.includeSubdomains is False
+    backend.setIncludeSubdomains(True)
+    assert backend.subdomainsExcluded is False
+
+
+def test_excluding_subdomains_pins_the_journey_to_one_page(backend):
+    """
+    "No subdomains" means "this is one static page", so N must collapse to 1.
+
+    Leaving N at 12 would promise twelve-page journeys that the scope can only
+    partly serve: the visitor would exhaust in-scope links and the run would spend
+    its budget finding nothing. The backend clamps it, not just the disabled QML
+    field, because a binding is not an enforcement.
+    """
+    backend.setMaxRequestsPerVisitor(9)
+    assert backend.maxRequestsPerVisitor == 9
+    backend.setIncludeSubdomains(False)
+    assert backend.maxRequestsPerVisitor == 1
+    assert backend.maxRequestsPerVisitorLocked is True
+    # A later write must not reopen it while the mode is on.
+    backend.setMaxRequestsPerVisitor(7)
+    assert backend.maxRequestsPerVisitor == 1
+
+
+def test_the_static_page_hint_names_the_pin(backend):
+    backend.setIncludeSubdomains(False)
+    assert "1" in backend.maxRequestsPerVisitorHint
+    backend.setIncludeSubdomains(True)
+    assert "1-" in backend.maxRequestsPerVisitorHint
+
+
+# -- authorization is implicit, the control is not --------------------------
+
+
+def test_the_backend_starts_authorized(backend):
+    """
+    No checkbox means the state must be true from construction.
+
+    The engine's gate still reads `scope.acknowledged`; what changed is that the
+    GUI supplies it, so a run cannot reach the gate unauthorized.
+    """
+    assert backend.acknowledged is True
+    assert backend.acknowledgmentNote == ab.AUTO_ACKNOWLEDGMENT_NOTE
+
+
+def test_the_built_config_carries_the_auto_acknowledgment(backend):
+    """The note has to survive into the engine's config, not just the property."""
+    _armed(backend)
+    config = backend._build_config()
+    assert config.scope.acknowledged is True
+    assert config.scope.acknowledgment_note == ab.AUTO_ACKNOWLEDGMENT_NOTE
+
+
+# -- the global ceiling is derived from the plan -----------------------------
+
+
+def test_the_ceiling_is_derived_from_the_traffic_plan(backend):
+    """
+    The ceiling must be the plan's own arithmetic, not a second guess.
+
+    With 1000 visitors, N=5, a 2.5% CTR and 10% headroom the derived budget is
+    5000 page + 75 funnel + 100 headroom = 5175. The funnel term is sized from the
+    clicking population because the CTR is independent of the per-visitor cap: a
+    visitor that clicks is not spending its one-of-N pages on the campaign hop.
+    """
+    _armed(backend)
+    backend.setVisitors(1000)
+    backend.setMaxRequestsPerVisitor(5)
+    parts = backend.safetyCeiling
+    assert parts["pages"] == 5000
+    assert parts["headroom"] == 100
+    assert parts["total"] == (
+        parts["pages"] + parts["funnel_requests"] + parts["headroom"]
+    )
+    assert "5000" in backend.safetyCeilingSummary
+
+
+def test_the_ceiling_grows_with_the_visitor_count(backend):
+    _armed(backend)
+    backend.setMaxRequestsPerVisitor(4)
+    backend.setVisitors(100)
+    small = backend.safetyCeiling["total"]
+    backend.setVisitors(400)
+    assert backend.safetyCeiling["total"] > small
+
+
+def test_the_ceiling_is_empty_without_a_derivable_target(backend):
+    """A half-filled form shows nothing rather than a misleading zero."""
+    backend.setTarget("")
+    assert backend.safetyCeiling == {}
+    assert backend.safetyCeilingSummary == ""
+
+
+def test_the_built_config_derives_its_ceiling(backend):
+    _armed(backend)
+    backend.setVisitors(1000)
+    backend.setMaxRequestsPerVisitor(5)
+    config = backend._build_config()
+    assert config.auto_scale_ceiling is True
+    assert config.resolved_limits().max_requests == config.ceiling_breakdown()["total"]
+
+
+def test_a_preview_does_not_create_directories(backend, tmp_path):
+    """
+    A property read must not touch the filesystem.
+
+    `safetyCeiling` is bound to the form, so it re-reads on keystrokes; creating
+    the artifact directory there would litter the disk as the operator types.
+    """
+    _armed(backend)
+    target = tmp_path / "not-yet"
+    backend.setArtifactDir(str(target))
+    backend._build_config_for_preview()
+    assert not target.exists()
+    backend._build_config()
+    assert target.exists()
