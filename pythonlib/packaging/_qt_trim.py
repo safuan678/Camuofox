@@ -95,11 +95,43 @@ _QT_PLUGIN_DENY = [
 #: Qt tooling that is only meaningful while writing or translating code, plus the
 #: C++ glue, docs and type stubs that PySide6 ships for IDE and binding authors.
 #: None of it is read at runtime.
+#:
+#: The QML/UI tooling -- `qmlcachegen`, `qmltyperegistrar`, `qsb`, `rcc`, `uic`,
+#: `svgtoqml`, `qmllint` -- is all build-time: the compiled forms it produces are
+#: already in the bundle as Python modules and QML data. `balsam`/`balsamui` are
+#: Qt Quick Designer's preview tools, and Designer itself is gone.
 _QT_TOOL_DENY = [
-    "qmlls", "qmlformat", "qmlimportscanner", "designer", "assistant",
-    "linguist", "lupdate", "lrelease", "include", "typesystems", "scripts",
-    "glue", "doc", "docs", "examples", "support",
+    "qmlls", "qmlformat", "qmlimportscanner", "qmlcachegen", "qmltyperegistrar",
+    "qmllint", "designer", "assistant", "balsam", "balsamui",
+    "linguist", "lupdate", "lrelease", "qsb", "rcc", "uic", "svgtoqml",
+    "include", "typesystems", "scripts", "glue", "doc", "docs", "examples",
+    "support",
 ]
+
+#: Directory names whose entire contents are build-time metadata. The other
+#: build-artifact directories (`typesystems`, `glue`, `scripts`, `support`) are
+#: already named in `_QT_TOOL_DENY` above and are matched as path components.
+_QT_DATA_DIR_DENY = [
+    "metatypes",  # per-class .json the C++ binding generator reads
+]
+
+#: Qt translation catalogues, matched by the module they translate rather than
+#: the bare tool name. `assistant_de.qm` has no `assistant` path component, so a
+#: component-only match kept 24 of them -- and their family is removed outright,
+#: which makes the catalogues for a tool that is not there dead weight.
+#:
+#: Qt's own catalogs are matched too. Qt ships 60-odd `qt_*.qm` and `qtbase_*.qm`
+#: files; nothing in this project installs a QTranslator, and Qt only consults
+#: them when a translator is installed, so they are never read.
+_QT_TRANSLATION_DENY_PREFIXES = [
+    "assistant_", "designer_", "linguist_", "qml_", "qmlscene_", "qmlviewer_",
+    "qt_", "qtbase_", "qtdeclarative_", "qtmultimedia_", "qtquickcontrols",
+    "qtquickcontrols2_", "qtconnectivity_", "qtlocation_", "qtserialport_",
+    "qtwebsockets_", "qtwebengine_", "qtwebview_",
+]
+
+#: Chromium's own locale payload, left behind by the WebEngine removal.
+_WEBENGINE_MARKERS = ("qtwebengine", "webengine")
 
 _SO_SUFFIX = re.compile(r"\.so(\..*)?$")
 _LIB_PREFIX = re.compile(r"^lib")
@@ -134,6 +166,14 @@ def is_denied_library(path) -> bool:
     return any(token.startswith(family) for family in _DENIED_FAMILIES)
 
 
+def _strip_suffix(name: str) -> str:
+    """A filename without the extension that hides which tool it belongs to."""
+    for suffix in (".exe", ".pyi", ".json", ".qm", ".dll", ".so", ".dylib"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def is_denied_qt_data(path) -> bool:
     """
     True when a collected PySide6 data file is a dev tool, stub or unused module.
@@ -151,9 +191,32 @@ def is_denied_qt_data(path) -> bool:
     if parts[-1].endswith(".pyi"):
         return True
 
+    # Matched on the stem, not the whole component: PySide6 ships the tools as
+    # `qmlls.exe` on Windows and as a bare `qmlls` elsewhere, and a component-only
+    # match recognised the second and kept the first.
+    stem = _strip_suffix(parts[-1])
+    if stem in _QT_TOOL_DENY:
+        return True
+
     for tool in _QT_TOOL_DENY:
         if tool in parts:
             return True
+
+    for directory in _QT_DATA_DIR_DENY:
+        if directory in parts:
+            return True
+
+    # `assistant_de.qm` carries its family in the filename prefix, not in a path
+    # component, so it needs its own match.
+    if parts[-1].endswith(".qm") and stem.startswith(tuple(_QT_TRANSLATION_DENY_PREFIXES)):
+        return True
+
+    # Chromium's locale payload, left behind when the WebEngine libraries were
+    # filtered out: the catalogs are `PySide6/translations/qtwebengine_locales/*.pak`
+    # and the directory, not the filename, is what identifies them. Matched across
+    # every component so both the directory and its contents go.
+    if any(marker in part.lower() for part in parts for marker in _WEBENGINE_MARKERS):
+        return True
 
     if "qml" in parts:
         index = parts.index("qml")
@@ -162,10 +225,14 @@ def is_denied_qt_data(path) -> bool:
             if any(module == denied or module.startswith(denied) for denied in _DENIED_QML_MODULES):
                 return True
 
-    # `PySide6/Qt/resources` holds Chromium's payload -- icudtl.dat, the V8
-    # snapshot and the .pak resource files. Qt itself keeps translations under
-    # `translations` and its fonts under `lib`, so the whole directory belongs to
-    # the WebEngine we are removing. Nothing else in the Qt stack reads it.
+    # Chromium's payload -- icudtl.dat, the V8 snapshots and the .pak resource
+    # files. It belongs to the WebEngine that was removed. Two layouts reach
+    # here: `PySide6/Qt/resources` from the Qt tree, and `PySide6/resources`
+    # from the binding's own copy, which has no `Qt` component for the check
+    # below to anchor on.
+    if parts[-2:] == ["PySide6", "resources"]:
+        return True
+
     if "Qt" in parts:
         index = parts.index("Qt")
         if index + 1 < len(parts) and parts[index + 1] == "resources":

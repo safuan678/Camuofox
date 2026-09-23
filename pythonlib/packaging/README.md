@@ -7,13 +7,14 @@ application, so the person running it does not need Python or pip.
 
 | Host | Command | Output |
 |------|---------|--------|
-| Windows | `packaging\build_windows.bat` | `dist\CamoufoxGUI\CamoufoxGUI.exe` |
-| Linux | `packaging/build_native.sh` | `dist/CamoufoxGUI/CamoufoxGUI` |
-| macOS | `packaging/build_native.sh` | `dist/CamoufoxGUI/CamoufoxGUI` |
+| Windows | `packaging\build_windows.bat` | `dist\CamoufoxGUI.exe` |
+| Linux | `packaging/build_native.sh` | `dist/CamoufoxGUI` |
+| macOS | `packaging/build_native.sh` | `dist/CamoufoxGUI.app` |
 
-The output is a **folder**, not a single file. Ship the whole folder: `_internal/`
-carries the Qt libraries, the QML tree and the Playwright driver, and the app will
-not start without it.
+The output is a **single file** (a `.app` directory bundle on macOS). There is no
+`_internal/` folder to ship alongside it and nothing to unzip: the executable
+carries the Qt libraries, the QML tree and the Playwright driver inside itself and
+unpacks them to a temporary directory when it starts.
 
 ## The one rule: build on the target OS
 
@@ -31,10 +32,10 @@ There is no flag that changes this.
 The Camoufox browser is a separate ~470 MB download per platform, fetched at
 runtime from GitHub Releases by `camoufox fetch` and stored under the platform
 cache directory (`%LOCALAPPDATA%\camoufox` on Windows, `~/.cache/camoufox` on
-Linux). It is not in the application folder.
+Linux). It is not in the executable.
 
 That is deliberate. Bundling it would add ~470 MB per supported OS, and it would
-break the moment a user moved the folder, because the path is recorded at install
+break the moment a user moved the file, because the path is recorded at install
 time. The first run therefore needs one of:
 
 * the GUI's **Browsers** tab → install a version, or
@@ -77,28 +78,35 @@ with `importlib.util.find_spec`).
 
 ## Windows notes
 
-* **The `--onedir` layout is used on purpose.** `--onefile` would unpack ~200 MB
-  to a temp directory on every launch, which is slow and trips antivirus
-  heuristics far more often.
+* **The `--onefile` layout is used on purpose.** The deliverable is one `.exe` to
+  double-click, with no folder to unzip or keep beside it. The trade-off is
+  start-up: the bootloader unpacks the payload to a temporary directory on every
+  launch, so the first window takes a few seconds longer than a folder build
+  would. That is also why the Qt trim matters more here than it would in a folder
+  build — anything left in the bundle is written to disk on every single launch.
 * **Unsigned executables get flagged.** Windows SmartScreen will warn on first
   run because the binary is not code-signed. Signing needs a certificate; there
   is no way around the warning without one.
 * **`console=False`** is set, so no terminal window appears. That also means a
   crash prints nowhere — which is exactly why `camoufox_launcher.py` writes
   `CamoufoxGUI-error.log` next to the executable and shows a dialog.
-* **Antivirus false positives** are common with PyInstaller output. A code-signing
+* **Antivirus false positives** are common with PyInstaller output, and a
+  self-extracting single file is a shape they watch for. A code-signing
   certificate is the only reliable fix.
 
 ## Building without a local machine: GitHub Actions
 
 `.github/workflows/package-gui.yml` runs on a tag push or on demand, and produces
-three archives. Nothing needs to be installed locally.
+one file per platform. Nothing needs to be installed locally.
 
 **To build and download the executables:**
 
 1. Repository → **Actions** → **Build desktop app** → **Run workflow**.
 2. When it finishes, download from the run's **Artifacts** section:
-   `CamoufoxGUI-windows-x64`, `CamoufoxGUI-linux-x64`, `CamoufoxGUI-macos-arm64`.
+   `CamoufoxGUI-windows-x64.exe` (one file, no zip), the bare
+   `CamoufoxGUI-linux-x64` binary, and `CamoufoxGUI-macos-arm64.zip` — a zip only
+   because a macOS `.app` is a directory and has to keep its structure and
+   symlinks.
 
 **To publish them as a release:**
 
@@ -107,7 +115,7 @@ git tag v0.5.6-gui
 git push origin v0.5.6-gui
 ```
 
-The three archives are attached to that tag's release automatically. The `release`
+The three files are attached to that tag's release automatically. The `release`
 job only runs for tags: an artifact from a manual run has no release to attach to.
 
 Prefer the manual run unless you actually want a release. The repository also has
@@ -127,9 +135,13 @@ asserts that a root object appears and that every `auditBackend.…` name the QM
 binds to exists on `AuditBackend`:
 
 ```bash
-./dist/CamoufoxGUI/CamoufoxGUI --self-check
-cat dist/CamoufoxGUI/CamoufoxGUI-selfcheck.log
+./dist/CamoufoxGUI --self-check
+cat dist/CamoufoxGUI-selfcheck.log
 ```
+
+In a single-file build this is the only step that exercises the onefile
+extraction itself: the executable has to unpack its payload before the check can
+even start, so a broken archive fails here rather than on the user's machine.
 
 A passing run reports how many bindings it resolved:
 
@@ -145,10 +157,14 @@ That is what catches a missing `datas` entry. Without it, a bad bundle presents 
 a window that never opens, with nothing in any log. The verdict goes to a file
 because a `console=False` build has no stderr to print to.
 
-The pipeline then checks the shipped files by name — `main.qml`, the icon,
-`browserforge.yml`, `language_tags`, the apify fingerprint archive, and
-Playwright's Node driver — so a failure names the file that went missing rather
-than just reporting a dead app.
+The pipeline then reads the executable's own archive (`pyi-archive_viewer`) and
+checks the shipped files by name — `main.qml`, the icon, `browserforge.yml`,
+`language_tags`, the apify fingerprint archive, Playwright's Node driver, and the
+Qt platform plugin — so a failure names the file that went missing rather than
+just reporting a dead app. A single-file build has no `_internal/` folder to look
+inside, so the payload is read out of the binary; that is also the stronger check,
+because it inspects what the bootloader will extract rather than what happened to
+be sitting next to it.
 
 On Windows the log is written before the process exits, so the gate reads the log
 rather than the exit code. A GUI-subsystem executable is not waited for by
@@ -162,7 +178,7 @@ and executable instead.
 
 ```bat
 REM The launcher writes this only when startup failed:
-type dist\CamoufoxGUI\CamoufoxGUI-error.log
+type dist\CamoufoxGUI-error.log
 ```
 
 A clean start leaves no such file. Then confirm the Audit tab appears and the
@@ -172,7 +188,7 @@ Traffic Plan block, not at the top.
 For a headless Linux check:
 
 ```bash
-xvfb-run -s "-screen 0 1440x900x24" dist/CamoufoxGUI/CamoufoxGUI
+xvfb-run -s "-screen 0 1440x900x24" dist/CamoufoxGUI
 ```
 
 ## Update this when the GUI changes

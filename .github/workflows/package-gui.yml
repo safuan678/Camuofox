@@ -1,7 +1,8 @@
 name: Build desktop app
 
 # Packages the Camoufox Manager GUI (Audit tab included) as a standalone
-# application, so it can be handed to someone who has no Python.
+# single-file application, so it can be handed to someone who has no Python:
+# one .exe on Windows, one binary on Linux, one .app on macOS. Nothing to unzip.
 #
 # PyInstaller does not cross-compile: each archive is built on the OS it runs on.
 # That is why this job is a matrix over runner images rather than one job with a
@@ -48,12 +49,18 @@ jobs:
           - name: windows-x64
             os: windows-latest
             artifact: CamoufoxGUI-windows-x64
+            # The single file a user double-clicks.
+            deliverable: dist/CamoufoxGUI-windows-x64.exe
           - name: linux-x64
             os: ubuntu-24.04
             artifact: CamoufoxGUI-linux-x64
+            deliverable: dist/CamoufoxGUI-linux-x64
           - name: macos-arm64
             os: macos-14
             artifact: CamoufoxGUI-macos-arm64
+            # A .app is a directory bundle, so it is zipped to keep its
+            # structure and symlinks; on macOS that zip *is* the app to the user.
+            deliverable: dist/CamoufoxGUI-macos-arm64.zip
 
     steps:
       - name: Check out repository
@@ -101,17 +108,19 @@ jobs:
         run: python -m PyInstaller pythonlib/packaging/camoufox-gui.spec --noconfirm --clean
 
       - name: Self-check the bundle (Linux)
-        # The headless gate: loads the real QML under the offscreen Qt platform.
-        # It catches the failures that are otherwise invisible -- a missing QML
-        # data file, a Qt QML module left out, a broken audit bridge.
+        # The headless gate: runs the real single-file executable, which unpacks
+        # itself and loads the actual QML under the offscreen Qt platform. It
+        # catches the failures that are otherwise invisible -- a missing QML data
+        # file, a Qt QML module left out, a broken audit bridge -- and it is also
+        # the only step that proves the onefile extraction works at all.
         if: runner.os == 'Linux'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          ./dist/CamoufoxGUI/CamoufoxGUI --self-check || true
+          ./dist/CamoufoxGUI --self-check || true
           echo "--- self-check verdict ---"
-          cat dist/CamoufoxGUI/CamoufoxGUI-selfcheck.log
-          grep -q "self-check OK" dist/CamoufoxGUI/CamoufoxGUI-selfcheck.log
+          cat dist/CamoufoxGUI-selfcheck.log
+          grep -q "self-check OK" dist/CamoufoxGUI-selfcheck.log
 
       - name: Self-check the bundle (macOS)
         # macOS CI runners have no window server, and Qt's offscreen plugin is
@@ -134,11 +143,11 @@ jobs:
           # Start-Process -Wait, not a plain call: PowerShell does not wait for
           # GUI-subsystem executables, so `&` returned immediately, $LASTEXITCODE
           # came back empty, and the log was read before it had been written.
-          $p = Start-Process -FilePath "dist\CamoufoxGUI\CamoufoxGUI.exe" `
+          $p = Start-Process -FilePath "dist\CamoufoxGUI.exe" `
                              -ArgumentList "--self-check" -Wait -PassThru
           Write-Host "exit code: $($p.ExitCode)"
 
-          $log = "dist\CamoufoxGUI\CamoufoxGUI-selfcheck.log"
+          $log = "dist\CamoufoxGUI-selfcheck.log"
           if (-not (Test-Path $log)) {
             Write-Host "no self-check log was written"
             exit 1
@@ -154,18 +163,37 @@ jobs:
 
       - name: Verify shipped data files
         # Asserts the assets a missing `datas` entry would strip, named
-        # individually so a failure says which one vanished. Paths differ per OS:
-        # Windows/Linux keep them under _internal/, a macOS .app under Resources.
+        # individually so a failure says which one vanished.
+        #
+        # A single-file build has no `_internal/` tree to look inside, so the
+        # payload is read out of the executable's own CArchive instead. That is
+        # also the stronger check: it inspects what the bootloader will extract,
+        # not what happened to be sitting in a folder next to the binary.
         shell: bash
         run: |
           set -eu
-          if [ -d "dist/CamoufoxGUI.app/Contents/Resources" ]; then
-            ROOT="dist/CamoufoxGUI.app/Contents/Resources"
-          else
-            ROOT="dist/CamoufoxGUI/_internal"
+          BIN="dist/CamoufoxGUI"
+          # `if`, not `[ ... ] && ...`: under `set -e` a false test in an && list
+          # aborts the step, which is how a Linux-only check would fail Windows.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="dist/CamoufoxGUI.exe"
           fi
-          [ -d "$ROOT" ] || { echo "no bundle root found"; ls -la dist; exit 1; }
-          echo "checking under $ROOT"
+          # macOS wraps the executable in the .app, so the raw path is gone.
+          if [ ! -f "$BIN" ] && [ -f "dist/CamoufoxGUI.app/Contents/MacOS/CamoufoxGUI" ]; then
+            BIN="dist/CamoufoxGUI.app/Contents/MacOS/CamoufoxGUI"
+          fi
+          [ -f "$BIN" ] || { echo "no executable at $BIN"; ls -la dist; exit 1; }
+          echo "reading archive from $BIN"
+
+          # `-b` lists bare names. The default listing goes through `repr()`,
+          # which on Windows renders `camoufox\gui\qml\main.qml` as
+          # `camoufox\\gui\\qml\\main.qml` -- doubled, so normalising the
+          # separator turns it into `camoufox//gui//...` and no pattern matches.
+          python -m PyInstaller.utils.cliutils.archive_viewer -l -b "$BIN" > archive.raw
+          tr '\\' '/' < archive.raw > archive.txt
+          echo "archive entries: $(wc -l < archive.txt)"
+          grep -c "PySide6" archive.txt | sed 's/^/PySide6 entries: /'
+
           for f in \
             camoufox/gui/qml/main.qml \
             camoufox/gui/assets/icon.ico \
@@ -173,48 +201,57 @@ jobs:
             camoufox/territoryInfo.xml \
             language_tags/data/json/index.json \
           ; do
-            test -e "$ROOT/$f" || { echo "MISSING: $f"; exit 1; }
+            grep -q -- "$f" archive.txt || { echo "MISSING: $f"; exit 1; }
             echo "ok: $f"
           done
           # The fingerprint generator's Bayesian network, inside a sub-package.
-          find "$ROOT/apify_fingerprint_datapoints" -name "input-network-definition.zip" -print -quit | grep -q . \
+          grep -q "input-network-definition.zip" archive.txt \
             || { echo "MISSING: apify input-network-definition.zip"; exit 1; }
           echo "ok: apify fingerprint data"
-          # Playwright's Node driver, without which no browser launches.
-          find "$ROOT/playwright/driver" -name "node*" -print -quit | grep -q . \
+          # Playwright's Node driver, without which no browser launches. The
+          # binary is `node` on POSIX and `node.exe` on Windows.
+          grep -qE "playwright/driver/node(\.exe)?" archive.txt \
             || { echo "MISSING: playwright node driver"; exit 1; }
           echo "ok: playwright driver"
+          # The Qt platform plugin: without it the extracted app cannot open a
+          # window on the user's machine, and nothing else in this list would
+          # notice, because the self-check runs offscreen.
+          grep -qE "plugins/platforms/(qwindows\.dll|libqxcb\.so|libqcocoa\.dylib)" archive.txt \
+            || { echo "MISSING: Qt platform plugin"; exit 1; }
+          echo "ok: Qt platform plugin"
 
       - name: Report size
         shell: bash
-        run: du -sh dist/CamoufoxGUI 2>/dev/null || true
+        run: |
+          du -h dist/CamoufoxGUI* 2>/dev/null || true
+          du -h "${{ matrix.deliverable }}" 2>/dev/null || true
 
-      - name: Package the folder
-        # The folder is the deliverable, not the binary: _internal/ carries Qt,
-        # the QML tree and the Playwright driver. macOS gets its .app alongside,
-        # because that is what a user double-clicks there.
+      - name: Package the deliverable
+        # Windows and Linux ship the executable itself -- there is nothing to
+        # unzip. macOS ships a zip of the .app, because a .app is a directory and
+        # a bare download of one loses its structure and symlinks.
         shell: bash
         run: |
           set -eu
           cd dist
-          TARGETS="CamoufoxGUI"
-          # `if` rather than `[ ... ] && ...`: under `set -e` a failing test in a
-          # && list would abort the step rather than just skip the .app.
-          if [ -d "CamoufoxGUI.app" ]; then
-            TARGETS="CamoufoxGUI CamoufoxGUI.app"
-          fi
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a -tzip "${{ matrix.artifact }}.zip" CamoufoxGUI >/dev/null
-          else
-            zip -qry "${{ matrix.artifact }}.zip" $TARGETS
-          fi
-          ls -lh "${{ matrix.artifact }}.zip"
+          case "${{ runner.os }}" in
+            Windows)
+              mv CamoufoxGUI.exe "${{ matrix.artifact }}.exe"
+              ;;
+            macOS)
+              zip -qry "${{ matrix.artifact }}.zip" CamoufoxGUI.app
+              ;;
+            *)
+              mv CamoufoxGUI "${{ matrix.artifact }}"
+              ;;
+          esac
+          ls -lh "${{ matrix.artifact }}"* || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.zip
+          path: ${{ matrix.deliverable }}
           if-no-files-found: error
           retention-days: 30
 
@@ -240,6 +277,11 @@ jobs:
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: archives/*.zip
+          # One file per platform: the .exe and the bare Linux binary, plus the
+          # macOS .app zip. Nothing else to attach.
+          files: |
+            archives/*.exe
+            archives/CamoufoxGUI-linux-x64
+            archives/*.zip
           # The tag already exists: it is what triggered this workflow.
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false

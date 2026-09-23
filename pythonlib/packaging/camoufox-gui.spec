@@ -6,20 +6,29 @@ Build (from the repository root, with the package installed into the build env):
 
     pyinstaller pythonlib/packaging/camoufox-gui.spec --noconfirm
 
-Output:
+Output: a single self-contained executable, no folder and no zip.
 
-    dist/CamoufoxGUI/CamoufoxGUI.exe      (Windows)
-    dist/CamoufoxGUI/CamoufoxGUI          (Linux / macOS)
+    dist/CamoufoxGUI.exe                  (Windows)
+    dist/CamoufoxGUI                     (Linux)
+    dist/CamoufoxGUI.app                 (macOS)
 
-`--onedir` is used on purpose. It starts far faster than `--onefile` (which
-unpacks ~200 MB to a temp directory on every launch) and it keeps the Qt plugins
-on disk where Qt can find them. The folder is the deliverable: zip it.
+`--onefile` is the deliberate choice here: the deliverable is one file the user
+double-clicks, with nothing to unzip and no `_internal/` tree to keep beside it.
+
+The cost is real and worth naming. Every launch unpacks the whole bundle to a
+temporary directory and re-extracts it again on the next run, so start-up is
+slower than a folder build and the disk sees the full payload each time. That is
+exactly why the trim below is not optional in this layout -- the 85 MB of Qt dev
+tooling, dead WebEngine locales and build metadata that `_qt_trim` removes would
+otherwise be written to disk on every single launch. The payload is kept as small
+as the app can honestly run on, and `--self-check` proves the extraction still
+produces a working window before the artifact is published.
 
 What is deliberately NOT bundled:
 
 * the Camoufox browser itself (~470 MB per platform). It is fetched on first use
   by the GUI's own Browsers tab, and it is platform-specific, so bundling it
-  would triple the download and still break if the user moved the folder.
+  would triple the download and still break if the user moved the file.
 """
 
 import sys
@@ -250,8 +259,13 @@ print(
 exe = EXE(
     pyz,
     a.scripts,
+    # The onefile difference: the collected binaries and data travel *inside* the
+    # executable rather than into a sibling folder, and there is no COLLECT. The
+    # bootloader unpacks them to a temporary directory at launch and runs the
+    # interpreter against that copy.
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="CamoufoxGUI",
     debug=False,
     bootloader_ignore_signals=False,
@@ -266,19 +280,9 @@ exe = EXE(
     icon=str(ICON),
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="CamoufoxGUI",
-)
-
-# macOS gets a real .app bundle on top of the folder: a bare Mach-O executable
-# has no Info.plist, so the Dock shows a generic icon and the window cannot be
-# focused or activated normally.
+# macOS: a BUNDLE wraps the executable in a real .app. Unlike the folder build
+# there is no COLLECT to point it at -- the payload is already inside the binary
+# -- so the executable itself is what gets wrapped.
 if sys.platform == "darwin":
     # BUNDLE accepts only .icns. PyInstaller converts the .ico for us, but only
     # when Pillow is importable; without it the build fails rather than falling
@@ -291,7 +295,7 @@ if sys.platform == "darwin":
         bundle_icon = None
 
     app = BUNDLE(
-        coll,
+        exe,
         name="CamoufoxGUI.app",
         icon=bundle_icon,
         bundle_identifier="com.camoufox.manager",
