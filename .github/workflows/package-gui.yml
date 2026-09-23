@@ -185,8 +185,13 @@ jobs:
           [ -f "$BIN" ] || { echo "no executable at $BIN"; ls -la dist; exit 1; }
           echo "reading archive from $BIN"
 
-          python -m PyInstaller.utils.cliutils.archive_viewer -l "$BIN" > archive.txt
+          python -m PyInstaller.utils.cliutils.archive_viewer -l "$BIN" > archive.raw
+          # PyInstaller records archive names with the host's separator, so a
+          # Windows build lists `camoufox\gui\qml\main.qml`. Normalise once here
+          # rather than making every pattern below carry two spellings.
+          tr '\\' '/' < archive.raw > archive.txt
           echo "archive entries: $(wc -l < archive.txt)"
+          grep -c "PySide6" archive.txt | sed 's/^/PySide6 entries: /'
 
           for f in \
             camoufox/gui/qml/main.qml \
@@ -202,16 +207,15 @@ jobs:
           grep -q "input-network-definition.zip" archive.txt \
             || { echo "MISSING: apify input-network-definition.zip"; exit 1; }
           echo "ok: apify fingerprint data"
-          # Playwright's Node driver, without which no browser launches.
-          grep -q "playwright/driver/node" archive.txt \
+          # Playwright's Node driver, without which no browser launches. The
+          # binary is `node` on POSIX and `node.exe` on Windows.
+          grep -qE "playwright/driver/node(\.exe)?" archive.txt \
             || { echo "MISSING: playwright node driver"; exit 1; }
           echo "ok: playwright driver"
           # The Qt platform plugin: without it the extracted app cannot open a
           # window on the user's machine, and nothing else in this list would
           # notice, because the self-check runs offscreen.
-          grep -q "plugins/platforms/qwindows.dll" archive.txt \
-            || grep -q "plugins/platforms/libqxcb.so" archive.txt \
-            || grep -q "plugins/platforms/libqcocoa.dylib" archive.txt \
+          grep -qE "plugins/platforms/(qwindows\.dll|libqxcb\.so|libqcocoa\.dylib)" archive.txt \
             || { echo "MISSING: Qt platform plugin"; exit 1; }
           echo "ok: Qt platform plugin"
 
