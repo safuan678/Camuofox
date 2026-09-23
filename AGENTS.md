@@ -130,8 +130,32 @@ language_tags), so the Qt filter belongs in the spec alone.
   Pdf and the qmlls/designer/linguist tools all go.
 - **The gate is `--self-check`**, run under `QT_QPA_PLATFORM=offscreen`, which
   loads the real QML and asserts the audit bindings resolve. Compare its output
-  to a baseline build's: "self-check OK: ... 64 audit bindings resolved" must be
-  byte-identical, not merely exit 0.
+  to a baseline build's: "self-check OK: ... audit bindings resolved" must be
+  byte-identical, not merely exit 0. (Currently 89 bindings across 19 files.
+  macOS is the exception: the PySide6 wheel ships no offscreen plugin, so CI
+  skips the self-check there and the `Verify shipped data files` step carries
+  the load.)
+
+### Onefile, and what it changes
+
+The deliverable is **one file** -- `dist/CamoufoxGUI.exe` on Windows,
+`dist/CamoufoxGUI` elsewhere, `dist/CamoufoxGUI.app` on macOS. The spec passes
+`a.binaries`/`a.datas` straight into `EXE` and has no `COLLECT`, so the old
+`_internal/` tree is gone. macOS is the odd one out: with no `coll` to wrap, the
+`BUNDLE` wraps the executable instead.
+
+- **Onefile re-extracts the entire payload on every launch**, so anything left in
+  the bundle is written to disk each time the user opens the app. Keep the trim
+  tight for that reason, not just for download size. Measured on the packaged
+  Windows exe: 333 MB of payload against 408 MB for the equivalent onedir tree.
+- **The archive listing is `repr()`-quoted by default, and on Windows that
+  doubles the separator** -- `'camoufox\\gui\\qml\\main.qml'` -- so folding the
+  separator yields `camoufox//gui//...` and nothing matches. Use
+  `archive_viewer -l -b` for bare names. CI reads the exe's own CArchive this
+  way because there is no folder left to walk.
+- **The self-check doubles as the extraction test.** It cannot pass unless the
+  archive unpacked, which makes it the right smoke gate for a onefile build.
+- Windows expects a SmartScreen warning: the exe is unsigned.
 
 Measured on this fork: 907 MB -> 517 MB (-43%) with the trim, self-check
 identical. Rebuild with
@@ -139,6 +163,11 @@ identical. Rebuild with
 
 `pythonlib/tests/test_packaging_trim.py` pins both sides -- every required Qt
 library is asserted to survive and every unused one to go.
+
+`.github/workflows/package-gui.yml` builds all three OSes and each job runs the
+self-check plus a CArchive data-file check before uploading. The `Attach to
+release` job only makes sense on a tag; a manual dispatch builds and uploads
+artifacts and stops there.
 
 ## Remotes
 
