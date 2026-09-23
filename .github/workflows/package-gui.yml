@@ -185,10 +185,11 @@ jobs:
           [ -f "$BIN" ] || { echo "no executable at $BIN"; ls -la dist; exit 1; }
           echo "reading archive from $BIN"
 
-          python -m PyInstaller.utils.cliutils.archive_viewer -l "$BIN" > archive.raw
-          # PyInstaller records archive names with the host's separator, so a
-          # Windows build lists `camoufox\gui\qml\main.qml`. Normalise once here
-          # rather than making every pattern below carry two spellings.
+          # `-b` lists bare names. The default listing goes through `repr()`,
+          # which on Windows renders `camoufox\gui\qml\main.qml` as
+          # `camoufox\\gui\\qml\\main.qml` -- doubled, so normalising the
+          # separator turns it into `camoufox//gui//...` and no pattern matches.
+          python -m PyInstaller.utils.cliutils.archive_viewer -l -b "$BIN" > archive.raw
           tr '\\' '/' < archive.raw > archive.txt
           echo "archive entries: $(wc -l < archive.txt)"
           grep -c "PySide6" archive.txt | sed 's/^/PySide6 entries: /'
@@ -200,7 +201,7 @@ jobs:
             camoufox/territoryInfo.xml \
             language_tags/data/json/index.json \
           ; do
-            grep -q -- "'$f'" archive.txt || { echo "MISSING: $f"; exit 1; }
+            grep -q -- "$f" archive.txt || { echo "MISSING: $f"; exit 1; }
             echo "ok: $f"
           done
           # The fingerprint generator's Bayesian network, inside a sub-package.
