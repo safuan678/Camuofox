@@ -16,6 +16,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# CI's pythonlib tier installs no Qt, so this module cannot even be imported
+# there. Skipping keeps that tier reporting what it actually verified instead of
+# failing collection on a dependency it was never given. These cases do run in
+# any environment that has PySide6 -- `pythonlib/tests` with the `gui` extra.
+pytest.importorskip("PySide6")
+
 from camoufox.gui import audit_backend as ab  # noqa: E402
 
 

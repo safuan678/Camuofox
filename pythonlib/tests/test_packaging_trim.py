@@ -280,3 +280,69 @@ def test_webengine_family_is_dropped_as_a_group():
         "libQt6WebEngineWidgets.so.6.11.2",
     ]
     assert all(is_denied_library(name) for name in webengine)
+
+
+def test_developer_tool_executables_are_dropped_by_their_stem():
+    # PySide6 ships these as `qmlls.exe` on Windows and as a bare `qmlls` on the
+    # other platforms. The original check compared whole path components, so it
+    # recognised the extensionless form and kept every `.exe` -- which is the
+    # only form Windows ever builds. 12 MB of IDE tooling rode along.
+    for name in (
+        "qmlls", "qmlformat", "qmlimportscanner", "designer", "assistant",
+        "linguist", "lupdate", "lrelease", "qmlcachegen", "qsb", "uic", "rcc",
+    ):
+        assert is_denied_qt_data(f"PySide6/{name}.exe"), f"{name}.exe should be dropped"
+        assert is_denied_qt_data(f"PySide6/{name}"), f"{name} should be dropped"
+
+
+def test_translation_catalogues_of_removed_tools_are_dropped():
+    # `assistant_de.qm` carries its family in the filename, not in a directory
+    # component, so the component match never saw the 24 designer and 24
+    # assistant catalogues. Nothing in this project installs a QTranslator, and
+    # the tools they translate are not in the bundle either.
+    for name in (
+        "assistant_de.qm", "assistant_pt_BR.qm", "designer_de.qm",
+        "designer_pt_BR.qm", "linguist_de.qm", "qt_de.qm", "qtbase_de.qm",
+        "qtdeclarative_de.qm", "qml_de.qm",
+    ):
+        assert is_denied_qt_data(f"PySide6/translations/{name}"), f"{name} should be dropped"
+
+
+def test_webengine_locale_payload_is_dropped_by_directory():
+    # The Chromium locale catalogs are `qtwebengine_locales/ml.pak`: the filename
+    # is a bare language code, so only the directory identifies them. 43 MB of
+    # dead locale data survived the library removal without this.
+    assert is_denied_qt_data("PySide6/translations/qtwebengine_locales/ml.pak")
+    assert is_denied_qt_data("PySide6/translations/qtwebengine_locales/bn.pak")
+    assert is_denied_qt_data("PySide6/translations/qtwebengine_locales/")
+
+
+def test_build_metadata_directories_are_dropped():
+    # `metatypes/` is 14 MB of per-class JSON that only the C++ binding generator
+    # reads; `typesystems/`, `glue/` and `scripts/` are the same kind of artifact.
+    assert is_denied_qt_data("PySide6/metatypes/qt6quick_metatypes.json")
+    assert is_denied_qt_data("PySide6/metatypes/qt6designer_metatypes.json")
+    assert is_denied_qt_data("PySide6/typesystems/typesystem_quick.xml")
+    assert is_denied_qt_data("PySide6/glue/qtcore.cpp")
+    assert is_denied_qt_data("PySide6/scripts/main.py")
+
+
+def test_qt_runtime_libraries_and_translations_are_not_overreached():
+    # The drop side above is aggressive, so pin the keep side against it. These
+    # are the Qt runtime pieces a window actually needs; none of them is a tool,
+    # a catalogue of a removed tool, or build metadata.
+    for path in (
+        "PySide6/Qt6Core.dll",
+        "PySide6/Qt6Gui.dll",
+        "PySide6/Qt6Quick.dll",
+        "PySide6/plugins/platforms/qwindows.dll",
+        "PySide6/plugins/platforms/qoffscreen.dll",
+        "PySide6/plugins/imageformats/qjpeg.dll",
+        "PySide6/plugins/tls/qopensslbackend.dll",
+        "PySide6/qml/QtQuick/Controls/Basic/qmldir",
+        "PySide6/qml/QtQuick/Layouts/qmldir",
+        "PySide6/qml/QtQml/qmldir",
+        "PySide6/translations/qtscript_de.pak",
+        "PySide6/Qt/qml/QtQuick/qmldir",
+    ):
+        assert not is_denied_qt_data(path), f"{path} is needed at runtime"
